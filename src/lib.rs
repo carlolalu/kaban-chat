@@ -46,3 +46,26 @@ impl Message {
         self.content.clone()
     }
 }
+
+/// Dispatch is the type of packet unit used exclusively by the server. It associates a message
+/// with an identifier, so that the clients can avoid to receive their own messages in cases of
+/// multiple equal nicknames.
+#[derive(Debug, Clone)]
+pub struct Dispatch {
+    userid: usize,
+    msg: Message,
+}
+
+impl Dispatch {
+    pub fn new(userid: usize, msg: Message) -> Dispatch {
+        Dispatch { userid, msg }
+    }
+
+    pub fn into_msg(self) -> Message {
+        self.msg
+    }
+
+    pub fn get_userid(&self) -> usize {
+        self.userid
+    }
+}
