@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncRead;
-use tokio::sync;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync,
+};
+
+use tokio_stream::StreamExt;
 
 // ########################################
 pub mod constant {
@@ -19,6 +23,11 @@ pub struct Message {
 }
 
 impl Message {
+    /// The delimiters to send serialised Messages in TCP connections. They are required to be
+    /// different from '{', '}', and to be different from each others.
+    pub(crate) const TCP_INIT_DELIMITER: u8 = b'|';
+    pub(crate) const TCP_END_DELIMITER: u8 = b'`';
+
     /// Maximal length (in chars) of the username.
     pub const MAX_USERNAME_LEN: usize = 32;
 
@@ -26,12 +35,27 @@ impl Message {
     pub const MAX_CONTENT_LEN: usize = 256;
 
     pub fn new(username: &str, content: &str) -> Message {
-        if username.len() > Message::MAX_USERNAME_LEN {
-            panic!("username too long");
+        assert_ne!(Message::TCP_INIT_DELIMITER, Message::TCP_END_DELIMITER);
+        assert_ne!(Message::TCP_INIT_DELIMITER, b'{');
+        assert_ne!(Message::TCP_INIT_DELIMITER, b'}');
+        assert_ne!(Message::TCP_END_DELIMITER, b'{');
+        assert_ne!(Message::TCP_END_DELIMITER, b'}');
+
+        let init_delimiter = char::from(Message::TCP_INIT_DELIMITER);
+        let end_delimiter = char::from(Message::TCP_END_DELIMITER);
+
+        if username.len() > Message::MAX_USERNAME_LEN
+            || username.contains(init_delimiter)
+            || username.contains(end_delimiter)
+        {
+            panic!("username not valid: too long or invalid chars");
         }
 
-        if content.len() > Message::MAX_CONTENT_LEN {
-            panic!("content too long");
+        if content.len() > Message::MAX_CONTENT_LEN
+            || content.contains(init_delimiter)
+            || content.contains(end_delimiter)
+        {
+            panic!("content not valid: too long or invalid chars");
         }
 
         Message {
@@ -76,6 +100,91 @@ impl Dispatch {
 pub async fn handle_msgs_reader(
     mut reader: impl AsyncRead + Unpin + Send + 'static,
     tx: sync::mpsc::Sender<Message>,
+    // todo: cancellation token
 ) {
-    let buffer_incoming: Vec<u8> = Vec::with_capacity(1000);
+    let init_delimiter = Message::TCP_INIT_DELIMITER;
+    let end_delimiter = Message::TCP_END_DELIMITER;
+
+    // todo: avoid magic nums
+    const BUFFER_LEN: usize = 1000;
+    let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_LEN);
+    let mut previous_fragment: Vec<u8> = Vec::with_capacity(BUFFER_LEN);
+
+    // divide the chunks
+    'process_reader: loop {
+        buffer.clear();
+        match reader.read_buf(&mut buffer).await {
+            Err(_e) => panic!("Error by the reader"),
+            Ok(n) if n > 0 => {
+                // assumptions:
+                // 1. previous fragment is initialised to smt, buffer as well
+                // 2. previous_fragment does not have any delimiter
+
+                let previous_fragment = &mut previous_fragment;
+                let actual_fragments: Vec<&[u8]> =
+                    buffer.split(|&byte| byte == end_delimiter).collect();
+
+                let (first_frag, actual_fragments) = match actual_fragments.split_first() {
+                    Some(smt) => (*smt.0, smt.1),
+                    None => panic!("The split iterator of the buffer is empty even though the reader read a non-null amount of bytes!"),
+                };
+
+                // process first msg
+                let serialised_msg = {
+                    match first_frag.first() {
+                        None => String::from_utf8(previous_fragment.clone()).unwrap(),
+                        Some(&byte) if byte == init_delimiter => {
+                            previous_fragment.append(&mut first_frag[1..].to_vec());
+                            String::from_utf8(previous_fragment.clone()).unwrap()
+                        }
+                        Some(&_byte) => String::from_utf8(first_frag.to_vec()).unwrap(),
+                    }
+                };
+                let first_msg = serde_json::from_str::<Message>(&serialised_msg).unwrap();
+                tx.send(first_msg).await.unwrap();
+
+                // process middle msgs
+                let (last_frag, middle_binary_msgs) = match actual_fragments.split_last() {
+                    Some(smt) => (*smt.0, smt.1),
+                    None => continue 'process_reader,
+                };
+
+                // todo: here put a 'with_capacity' inherent to the buffer_len
+                let mut middle_msgs = Vec::with_capacity(20);
+
+                let _ = middle_binary_msgs.iter().map(|&raw_binary_msg| {
+                    let binary_msg = match raw_binary_msg.first() {
+                        None => panic!("This information unit should have a been complete but is of length 0!"),
+                        Some(&ch) if ch == init_delimiter => raw_binary_msg[1..].to_vec(),
+                        Some(&_ch) => panic!("This information unit should have should have started with the end delimiter but it does not!"),
+                    };
+                    let serialised_msg = String::from_utf8(binary_msg).unwrap();
+                    let msg = serde_json::from_str(&serialised_msg).unwrap();
+                    middle_msgs.push(msg);
+                });
+
+                let mut stream = tokio_stream::iter(middle_msgs);
+                while let Some(msg) = stream.next().await {
+                    tx.send(msg).await.unwrap();
+                }
+
+                // process last_msg and initialise the 'previous_fragment' for the next round
+                if let Some(&ch) = buffer.last() {
+                    if ch == end_delimiter {
+                        previous_fragment.clear();
+                        let serialised_msg = String::from_utf8(last_frag[1..].to_vec()).unwrap();
+                        let msg = serde_json::from_str(&serialised_msg).unwrap();
+                        tx.send(msg).await.unwrap();
+                    } else {
+                        *previous_fragment = last_frag.to_vec();
+                        previous_fragment.reserve(BUFFER_LEN);
+                        continue 'process_reader;
+                    }
+                } else {
+                    panic!();
+                }
+            }
+            Ok(_zero) => break 'process_reader,
+        }
+    }
 }
