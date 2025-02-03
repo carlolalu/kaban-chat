@@ -34,7 +34,7 @@ impl Message {
     /// Maximal length (in chars) of the content of the message.
     pub const MAX_CONTENT_LEN: usize = 256;
 
-    pub fn new(username: &str, content: &str) -> Message {
+    pub fn has_invalid_chars(text: &str) -> bool {
         assert_ne!(Message::TCP_INIT_DELIMITER, Message::TCP_END_DELIMITER);
         assert_ne!(Message::TCP_INIT_DELIMITER, b'{');
         assert_ne!(Message::TCP_INIT_DELIMITER, b'}');
@@ -44,17 +44,19 @@ impl Message {
         let init_delimiter = char::from(Message::TCP_INIT_DELIMITER);
         let end_delimiter = char::from(Message::TCP_END_DELIMITER);
 
-        if username.len() > Message::MAX_USERNAME_LEN
-            || username.contains(init_delimiter)
-            || username.contains(end_delimiter)
-        {
+        if text.contains(init_delimiter) || text.contains(end_delimiter) {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn new(username: &str, content: &str) -> Message {
+        if username.len() > Message::MAX_USERNAME_LEN || Self::has_invalid_chars(username) {
             panic!("username not valid: too long or invalid chars");
         }
 
-        if content.len() > Message::MAX_CONTENT_LEN
-            || content.contains(init_delimiter)
-            || content.contains(end_delimiter)
-        {
+        if content.len() > Message::MAX_CONTENT_LEN || Self::has_invalid_chars(content) {
             panic!("content not valid: too long or invalid chars");
         }
 
@@ -64,12 +66,33 @@ impl Message {
         }
     }
 
+    pub fn many_new(username: &str, text: &str) -> Vec<Message> {
+        let msgs: Vec<_> = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(Message::MAX_CONTENT_LEN)
+            .map(|chars_content| chars_content.iter().collect::<String>())
+            .map(|content| Message::new(username, &content))
+            .collect();
+        msgs
+    }
+
     pub fn get_username(&self) -> String {
         self.username.clone()
     }
 
     pub fn get_content(&self) -> String {
         self.content.clone()
+    }
+
+    pub fn paket(self) -> String {
+        let serialized = serde_json::to_string(&self).unwrap();
+        let paketed = format!(
+            "{}{serialized}{}",
+            Message::TCP_INIT_DELIMITER,
+            Message::TCP_END_DELIMITER
+        );
+        paketed
     }
 }
 
