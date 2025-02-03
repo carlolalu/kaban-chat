@@ -1,5 +1,6 @@
-// ########################################
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncRead;
+use tokio::sync;
 
 // ########################################
 pub mod constant {
@@ -8,6 +9,7 @@ pub mod constant {
 }
 
 // ########################################
+
 /// Message is the type of packet unit that the client uses. They comprehend a username of at most
 /// MAX_USERNAME_LEN chars and a content of at most MAX_CONTENT_LEN chars.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -68,4 +70,12 @@ impl Dispatch {
     pub fn get_userid(&self) -> usize {
         self.userid
     }
+}
+
+/// This function reads messages from a Reader and forward them through its channel.
+pub async fn handle_msgs_reader(
+    mut reader: impl AsyncRead + Unpin + Send + 'static,
+    tx: sync::mpsc::Sender<Message>,
+) {
+    let buffer_incoming: Vec<u8> = Vec::with_capacity(1000);
 }
