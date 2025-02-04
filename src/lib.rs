@@ -376,6 +376,8 @@ pub mod test_util {
 
 #[cfg(test)]
 pub mod test {
+    use tokio_util::task::TaskTracker;
+
     use crate::*;
 
     #[test]
@@ -502,6 +504,47 @@ pub mod test {
                 column: 1
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_messages() -> Result<(), Box<dyn std::error::Error>> {
+        let num_messages = 700;
+
+        let paket_bytes: Vec<u8> = (0..num_messages)
+            .map(|num| {
+                test_util::craft_random_msg(&format!("{num}"))
+                    .unwrap()
+                    .string_paket()
+                    .unwrap()
+                    .bytes()
+                    .collect::<Vec<u8>>()
+            })
+            .flatten()
+            .collect();
+
+        let reader = tokio_test::io::Builder::new().read(&paket_bytes).build();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(20);
+
+        let task_tracker = TaskTracker::new();
+
+        task_tracker.spawn(async move {
+            handle_msgs_reader(reader, tx).await?;
+            Ok::<(), MsgReaderError>(())
+        });
+
+        task_tracker.spawn(async move {
+            while let Some(result) = rx.recv().await {
+                // println!("result: {:?}", result);
+                assert!(result.is_ok());
+            }
+            Ok::<(), TextValidityError>(())
+        });
+
+        task_tracker.close();
+        task_tracker.wait().await;
+
         Ok(())
     }
 }
