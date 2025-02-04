@@ -377,6 +377,7 @@ pub mod test_util {
 #[cfg(test)]
 pub mod test {
     use crate::*;
+    use tokio_util::task::TaskTracker;
 
     #[test]
     fn test_text_validity() {
@@ -500,6 +501,52 @@ pub mod test {
                 column: 1
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_messages() -> Result<(), Box<dyn std::error::Error>> {
+        let num_messages = 100;
+
+        let paket_bytes: Vec<u8> = (0..num_messages)
+            .map(|num| {
+                let username = format!("user{}", num);
+                let random_message = test_util::craft_random_msg(&username).unwrap();
+                random_message
+                    .string_paket()
+                    .unwrap()
+                    .bytes()
+                    .collect::<Vec<u8>>()
+            })
+            .flatten()
+            .collect();
+
+        let reader = tokio_test::io::Builder::new().read(&paket_bytes).build();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(20);
+
+        let task_tracker = TaskTracker::new();
+
+        task_tracker.spawn(async move {
+            handle_msgs_reader(reader, tx).await?;
+            Ok::<(), MsgReaderError>(())
+        });
+
+        task_tracker.spawn(async move {
+            while let Some(result) = rx.recv().await {
+                // println!("result: {:?}", result);
+                assert!(result.is_ok());
+
+                if let Ok(_msg) = result {
+                    // println!("{}:> {}", _msg.get_username(), _msg.get_content());
+                }
+            }
+            Ok::<(), TextValidityError>(())
+        });
+
+        task_tracker.close();
+        task_tracker.wait().await;
+
         Ok(())
     }
 }
