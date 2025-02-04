@@ -80,21 +80,21 @@ impl Message {
     }
 
     pub fn new(username: &str, content: &str) -> Result<Message, TextValidityError> {
-        if username.len() > Message::MAX_USERNAME_LEN {
+        if username.chars().count() > Message::MAX_USERNAME_LEN {
             return Err(TextValidityError::TooLong {
                 kind_of_entity: "username".to_string(),
                 actual_entity: username.to_string(),
                 max_len: Message::MAX_USERNAME_LEN,
-                actual_len: username.len(),
+                actual_len: username.chars().count(),
             });
         }
 
-        if content.len() > Message::MAX_CONTENT_LEN {
+        if content.chars().count() > Message::MAX_CONTENT_LEN {
             return Err(TextValidityError::TooLong {
                 kind_of_entity: "content".to_string(),
                 actual_entity: content.to_string(),
                 max_len: Message::MAX_CONTENT_LEN,
-                actual_len: content.len(),
+                actual_len: content.chars().count(),
             });
         }
 
@@ -340,11 +340,43 @@ pub enum MsgReaderError {
     },
 }
 
+pub mod test_util {
+    use rand::Rng;
+
+    use crate::*;
+
+    pub fn craft_random_valid_text(char_length: usize) -> String {
+        use rand::distr::{SampleString, StandardUniform};
+
+        let random_string: String = StandardUniform.sample_string(&mut rand::rng(), char_length);
+
+        let random_valid_text: String = random_string
+            .chars()
+            .map(|mut ch| {
+                while ch == Message::TCP_INIT_DELIMITER_U8 as char
+                    || ch == Message::TCP_END_DELIMITER_U8 as char
+                {
+                    ch = rand::rng().sample(StandardUniform);
+                }
+                ch
+            })
+            .collect();
+        //println!("random_valid_text: [[[{random_valid_text}]]]");
+
+        random_valid_text
+    }
+
+    pub fn craft_random_msg(username: &str) -> Message {
+        let valid_text = craft_random_valid_text(Message::MAX_CONTENT_LEN);
+        Message::new(username, &valid_text).expect("The random message construction failed.")
+    }
+}
+
 // ############################## TEST ##############################
 
 #[cfg(test)]
-mod test {
-    use crate::{Message, MsgFromUtf8PaketError, TextValidityError};
+pub mod test {
+    use crate::*;
 
     #[test]
     fn test_text_validity() {
@@ -378,7 +410,7 @@ mod test {
                 kind_of_entity: "content".to_string(),
                 actual_entity: too_long_content.to_string(),
                 max_len: Message::MAX_CONTENT_LEN,
-                actual_len: too_long_content.len()
+                actual_len: too_long_content.chars().count()
             })
         );
         assert_eq!(
@@ -387,13 +419,33 @@ mod test {
                 kind_of_entity: "username".to_string(),
                 actual_entity: too_long_name.to_string(),
                 max_len: Message::MAX_USERNAME_LEN,
-                actual_len: too_long_name.len()
+                actual_len: too_long_name.chars().count()
             })
         );
 
         assert_eq!(Message::has_invalid_chars(&invalid_chars_text_1), true);
         assert_eq!(Message::has_invalid_chars(&invalid_chars_text_2), true);
         assert_eq!(Message::has_invalid_chars(&valid_name), false);
+    }
+
+    #[test]
+    fn test_craft_random_valid_text() {
+        for _ in 0..100 {
+            let random_valid_text = test_util::craft_random_valid_text(80);
+            assert_eq!(random_valid_text.chars().count(), 80);
+            assert_eq!(Message::has_invalid_chars(&random_valid_text), false);
+            // println!("Your random valid text is: [[[{random_valid_text}]]]");
+        }
+    }
+
+    #[test]
+    fn test_craft_random_msg() {
+        for _ in 0..100 {
+            let random_username = test_util::craft_random_valid_text(Message::MAX_USERNAME_LEN);
+            let _random_msg_result = test_util::craft_random_msg(&random_username);
+
+            // println!("msg_result: [[[{:?}]]]", _random_msg_result);
+        }
     }
 
     #[test]
