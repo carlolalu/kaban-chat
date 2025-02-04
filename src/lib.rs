@@ -343,8 +343,17 @@ pub enum MsgReaderError {
 // ############################## TEST ##############################
 
 #[cfg(test)]
-mod test {
+pub mod test {
     use crate::{Message, MsgFromUtf8PaketError, TextValidityError};
+
+
+    pub fn craft_random_valid_text(char_length: usize) -> Message {
+        todo!();
+    }
+
+    pub fn craft_random_msg(username: &str) -> Message {
+        todo!();
+    }
 
     #[test]
     fn test_text_validity() {
