@@ -48,14 +48,18 @@ flowchart TB
 The choice had to be made between generic errors which could easily be converted (on the trace of the `anyhow` crate) or a bit more precise errors (on the trace of the `thiserror` crate). The choice fell on the latter one.
 
 - `lib.rs`:
-  - `enum MessageError`
-    - TooLongUsername
-    - TooLongContent
-    - InvalidCharsUsername
-    - InvalidCharsContent
-  - `enum ReaderError`
-    - conversion from async io error
-    - propagation of MessageError
+  - `enum TextValidityError`
+    - TooLong
+    - InvalidChars
+  - `enum MsgFromUtf8PaketError`
+    - NoInitDelimiter
+    - NoEndDelimiter
+    - SerdeJson
+    - StringFromUtf8
+    - EmptyPaket
+  - `enum MsgReaderError`
+    - conversion from various underlying errors
+    - EmptyEntity
 
 
 ## Notes for me

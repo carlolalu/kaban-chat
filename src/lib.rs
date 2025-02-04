@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync,
@@ -6,6 +7,7 @@ use tokio::{
 
 use tokio_stream::StreamExt;
 
+use crate::MsgFromUtf8PaketError::SerdeJson;
 use thiserror::Error;
 
 // ############################## CONSTANTS ##############################
@@ -28,8 +30,8 @@ pub struct Message {
 impl Message {
     /// The delimiters to send serialised Messages in TCP connections. They are required to be
     /// different from '{', '}', and to be different from each others.
-    pub(crate) const TCP_INIT_DELIMITER: u8 = b'|';
-    pub(crate) const TCP_END_DELIMITER: u8 = b'`';
+    pub(crate) const TCP_INIT_DELIMITER_U8: u8 = b'|';
+    pub(crate) const TCP_END_DELIMITER_U8: u8 = b'`';
 
     /// Maximal length (in chars) of the username.
     pub const MAX_USERNAME_LEN: usize = 32;
@@ -37,17 +39,40 @@ impl Message {
     /// Maximal length (in chars) of the content of the message.
     pub const MAX_CONTENT_LEN: usize = 256;
 
+    /// Maximal length (in bytes) of a paketed message (=JSON serialised message sorrounded by the delimiters)
+    ///
+    /// The reasoning is that if the serialised message contains a special character (e.g. '{') at every
+    /// (utf8-)char of the username and at every (utf8-)char of the content, and if such char
+    /// is exactly 1 byte long, then the message will double its username and content u8_len, because the
+    /// special char, in the serialization process, will be preceded by a '\' symbol (e.g. '\{').
+    pub const MAX_PAKETED_MSG_U8_LEN: usize = {
+        let delimiters_u8_len = 2_usize;
+
+        // Rough estimate of "{\n""\n}, etc...
+        let json_encapsulation_u8_len = 20_usize;
+
+        let max_char_u8_len = 4_usize;
+        let special_char_serialised_u8_len = max_char_u8_len * 2;
+
+        let max_serialised_msg_u8_len = json_encapsulation_u8_len
+            + (Message::MAX_USERNAME_LEN + Message::MAX_CONTENT_LEN)
+                * special_char_serialised_u8_len;
+        max_serialised_msg_u8_len + delimiters_u8_len
+    };
+
     pub fn has_invalid_chars(text: &str) -> bool {
-        assert_ne!(Message::TCP_INIT_DELIMITER, Message::TCP_END_DELIMITER);
-        assert_ne!(Message::TCP_INIT_DELIMITER, b'{');
-        assert_ne!(Message::TCP_INIT_DELIMITER, b'}');
-        assert_ne!(Message::TCP_END_DELIMITER, b'{');
-        assert_ne!(Message::TCP_END_DELIMITER, b'}');
+        assert_ne!(
+            Message::TCP_INIT_DELIMITER_U8,
+            Message::TCP_END_DELIMITER_U8
+        );
+        assert_ne!(Message::TCP_INIT_DELIMITER_U8, b'{');
+        assert_ne!(Message::TCP_INIT_DELIMITER_U8, b'}');
+        assert_ne!(Message::TCP_END_DELIMITER_U8, b'{');
+        assert_ne!(Message::TCP_END_DELIMITER_U8, b'}');
 
-        let init_delimiter = char::from(Message::TCP_INIT_DELIMITER);
-        let end_delimiter = char::from(Message::TCP_END_DELIMITER);
-
-        if text.contains(init_delimiter) || text.contains(end_delimiter) {
+        if text.contains(Message::TCP_INIT_DELIMITER_U8 as char)
+            || text.contains(Message::TCP_END_DELIMITER_U8 as char)
+        {
             true
         } else {
             false
@@ -112,20 +137,53 @@ impl Message {
         self.content.clone()
     }
 
-    pub fn paket(self) -> Result<String, serde_json::Error> {
+    pub fn string_paket(self) -> Result<String, serde_json::Error> {
         let serialized = serde_json::to_string(&self)?;
         let paketed = format!(
             "{}{serialized}{}",
-            Message::TCP_INIT_DELIMITER,
-            Message::TCP_END_DELIMITER
+            Message::TCP_INIT_DELIMITER_U8 as char,
+            Message::TCP_END_DELIMITER_U8 as char
         );
         Ok(paketed)
+    }
+
+    fn from_utf8_paket(candidate: Vec<u8>) -> Result<Message, MsgFromUtf8PaketError> {
+        match candidate.first() {
+            Some(&byte) if byte == Message::TCP_INIT_DELIMITER_U8 => (),
+            Some(&_byte) => return Err(MsgFromUtf8PaketError::NoInitDelimiter { candidate }),
+            None => return Err(MsgFromUtf8PaketError::EmptyPaket),
+        };
+
+        match candidate.last() {
+            Some(&byte) if byte == Message::TCP_END_DELIMITER_U8 => (),
+            Some(&_byte) => return Err(MsgFromUtf8PaketError::NoEndDelimiter { candidate }),
+            None => return Err(MsgFromUtf8PaketError::EmptyPaket),
+        };
+
+        let dispaketed = candidate[1..candidate.len() - 1].to_vec();
+        let serialised = String::from_utf8(dispaketed)?;
+        let message: Message = match serde_json::from_str(&serialised) {
+            Ok(msg) => msg,
+            Err(serde_json_err) => {
+                let category = serde_json_err.classify();
+                let io_error_kind = serde_json_err.io_error_kind();
+                let (line, column) = (serde_json_err.line(), serde_json_err.column());
+                return Err(SerdeJson {
+                    dispaketed_candidate: serialised,
+                    category,
+                    io_error_kind,
+                    line,
+                    column,
+                });
+            }
+        };
+        Ok(message)
     }
 }
 
 #[derive(Error, Debug, PartialEq)]
 pub enum TextValidityError {
-    #[error(r##"Too long {kind_of_entity} (expected at most {max_len} chars, found {actual_len}): [[{actual_entity}]]"##)]
+    #[error(r##"Too long {kind_of_entity} (expected at most {max_len} chars, found {actual_len}): [[{actual_entity}]]."##)]
     TooLong {
         kind_of_entity: String,
         actual_entity: String,
@@ -133,14 +191,44 @@ pub enum TextValidityError {
         actual_len: usize,
     },
     #[error(
-        r##"Invalid chars found in {kind_of_entity} (invalid chars: '{}','{}'): [[{actual_entity}]]"##,
-        Message::TCP_INIT_DELIMITER,
-        Message::TCP_END_DELIMITER
+        r##"Invalid chars found in {kind_of_entity} (invalid chars: '{}','{}'): [[{actual_entity}]]."##,
+        Message::TCP_INIT_DELIMITER_U8 as char,
+        Message::TCP_END_DELIMITER_U8 as char
     )]
     InvalidChars {
         kind_of_entity: String,
         actual_entity: String,
     },
+}
+
+#[derive(Error, Debug, PartialEq)]
+#[error(transparent)]
+pub enum MsgFromUtf8PaketError {
+    #[error(
+        r##"No init delimiter ({}) found in the utf8 sample. The sample is: [[{candidate:?}]]."##,
+        Message::TCP_INIT_DELIMITER_U8 as char
+    )]
+    NoInitDelimiter {
+        candidate: Vec<u8>,
+    },
+    #[error(
+        r##"No end delimiter ({}) found in the utf8 sample. The sample is: [[{candidate:?}]]."##,
+        Message::TCP_END_DELIMITER_U8 as char
+    )]
+    NoEndDelimiter {
+        candidate: Vec<u8>,
+    },
+    #[error(r##"serde_json Error: [[{dispaketed_candidate:?}]], {category:?}, {io_error_kind:?}, at coord (line, column)=({line},{column})."##)]
+    SerdeJson {
+        dispaketed_candidate: String,
+        category: Category,
+        io_error_kind: Option<std::io::ErrorKind>,
+        line: usize,
+        column: usize,
+    },
+    StringFromUtf8(#[from] std::string::FromUtf8Error),
+    #[error(r##"The utf8 paket given was empty."##)]
+    EmptyPaket,
 }
 
 /// Dispatch is the type of packet unit used exclusively by the server. It associates a message
@@ -171,101 +259,92 @@ impl Dispatch {
 /// This function reads messages from a Reader and forward them through its channel.
 pub async fn handle_msgs_reader(
     mut reader: impl AsyncRead + Unpin + Send + 'static,
-    tx: sync::mpsc::Sender<Message>,
-    // todo: cancellation token
-) {
-    let init_delimiter = Message::TCP_INIT_DELIMITER;
-    let end_delimiter = Message::TCP_END_DELIMITER;
+    tx: sync::mpsc::Sender<Result<Message, MsgFromUtf8PaketError>>,
+    // cancellation token
+) -> Result<(), MsgReaderError> {
+    let msgs_per_buffer = 10_usize;
 
-    // todo: avoid magic nums
-    const BUFFER_LEN: usize = 1000;
-    let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_LEN);
-    let mut previous_fragment: Vec<u8> = Vec::with_capacity(BUFFER_LEN);
+    let mut buffer: Vec<u8> = Vec::with_capacity(Message::MAX_PAKETED_MSG_U8_LEN * msgs_per_buffer);
+    let mut previous_fragment: Vec<u8> = Vec::with_capacity(Message::MAX_PAKETED_MSG_U8_LEN);
 
-    // divide the chunks
-    'process_reader: loop {
+    'write_on_buffer: loop {
         buffer.clear();
         match reader.read_buf(&mut buffer).await {
-            Err(_e) => panic!("Error by the reader"),
             Ok(n) if n > 0 => {
-                // assumptions:
-                // 1. previous fragment is initialised to smt, buffer as well
-                // 2. previous_fragment does not have any delimiter
+                // Loop assumption: previous_fragment is initialised (eventually empty)
 
                 let previous_fragment = &mut previous_fragment;
-                let actual_fragments: Vec<&[u8]> =
-                    buffer.split(|&byte| byte == end_delimiter).collect();
+                let actual_fragments: Vec<&[u8]> = buffer
+                    .split_inclusive(|&byte| byte == Message::TCP_END_DELIMITER_U8)
+                    .collect();
 
-                let (first_frag, actual_fragments) = match actual_fragments.split_first() {
+                let (first_fragment, actual_fragments) = match actual_fragments.split_first() {
                     Some(smt) => (*smt.0, smt.1),
-                    None => panic!("The split iterator of the buffer is empty even though the reader read a non-null amount of bytes!"),
-                };
-
-                // process first msg
-                let serialised_msg = {
-                    match first_frag.first() {
-                        None => String::from_utf8(previous_fragment.clone()).unwrap(),
-                        Some(&byte) if byte == init_delimiter => {
-                            previous_fragment.append(&mut first_frag[1..].to_vec());
-                            String::from_utf8(previous_fragment.clone()).unwrap()
-                        }
-                        Some(&_byte) => String::from_utf8(first_frag.to_vec()).unwrap(),
+                    // todo: migliora questo errore
+                    None => {
+                        return Err(MsgReaderError::UnusualEmptyEntity {
+                            entity: "buffer.split(end_delimiter).split_first()".to_string(),
+                        })
                     }
                 };
-                let first_msg = serde_json::from_str::<Message>(&serialised_msg).unwrap();
-                tx.send(first_msg).await.unwrap();
 
-                // process middle msgs
-                let (last_frag, middle_binary_msgs) = match actual_fragments.split_last() {
+                let first_paket_candidate = previous_fragment
+                    .iter()
+                    .chain(first_fragment.iter())
+                    .map(|&byte| byte)
+                    .collect();
+                let first_msg_result = Message::from_utf8_paket(first_paket_candidate);
+                tx.send(first_msg_result).await?;
+
+                let (last_fragment, middle_fragments) = match actual_fragments.split_last() {
                     Some(smt) => (*smt.0, smt.1),
-                    None => continue 'process_reader,
+                    None => continue 'write_on_buffer,
                 };
 
-                // todo: here put a 'with_capacity' inherent to the buffer_len
-                let mut middle_msgs = Vec::with_capacity(20);
-
-                let _ = middle_binary_msgs.iter().map(|&raw_binary_msg| {
-                    let binary_msg = match raw_binary_msg.first() {
-                        None => panic!("This information unit should have a been complete but is of length 0!"),
-                        Some(&ch) if ch == init_delimiter => raw_binary_msg[1..].to_vec(),
-                        Some(&_ch) => panic!("This information unit should have should have started with the end delimiter but it does not!"),
-                    };
-                    let serialised_msg = String::from_utf8(binary_msg).unwrap();
-                    let msg = serde_json::from_str(&serialised_msg).unwrap();
-                    middle_msgs.push(msg);
-                });
-
-                let mut stream = tokio_stream::iter(middle_msgs);
-                while let Some(msg) = stream.next().await {
-                    tx.send(msg).await.unwrap();
+                let mut stream = tokio_stream::iter(middle_fragments);
+                while let Some(&fragment) = stream.next().await {
+                    let msg_result = Message::from_utf8_paket(fragment.to_vec());
+                    tx.send(msg_result).await?;
                 }
 
-                // process last_msg and initialise the 'previous_fragment' for the next round
-                if let Some(&ch) = buffer.last() {
-                    if ch == end_delimiter {
-                        previous_fragment.clear();
-                        let serialised_msg = String::from_utf8(last_frag[1..].to_vec()).unwrap();
-                        let msg = serde_json::from_str(&serialised_msg).unwrap();
-                        tx.send(msg).await.unwrap();
-                    } else {
-                        *previous_fragment = last_frag.to_vec();
-                        previous_fragment.reserve(BUFFER_LEN);
-                        continue 'process_reader;
+                // The loop assumptions are fullfilled here
+                match last_fragment.last() {
+                    Some(&ch) if ch == Message::TCP_END_DELIMITER_U8 => {
+                        let last_msg_result = Message::from_utf8_paket(last_fragment.to_vec());
+                        tx.send(last_msg_result).await?;
+                        previous_fragment.clear()
                     }
-                } else {
-                    panic!();
+                    Some(&_ch) => *previous_fragment = last_fragment.to_vec(),
+                    None => {
+                        return Err(MsgReaderError::UnusualEmptyEntity {
+                            entity: "last_fragment.last()".to_string(),
+                        })
+                    }
                 }
             }
-            Ok(_zero) => break 'process_reader,
+            Ok(_zero) => break 'write_on_buffer,
+            Err(err) => return Err(MsgReaderError::Io(err)),
         }
     }
+    Ok(())
+}
+
+#[derive(Error, Debug)]
+#[error(transparent)]
+pub enum MsgReaderError {
+    Io(#[from] std::io::Error),
+    TxSend(#[from] tokio::sync::mpsc::error::SendError<Result<Message, MsgFromUtf8PaketError>>),
+    #[error("Unsual None returned from '{entity}' in 'handle_msgs_reader'.")]
+    UnusualEmptyEntity {
+        entity: String,
+    },
 }
 
 // ############################## TEST ##############################
 
 #[cfg(test)]
 mod test {
-    use crate::{Message, TextValidityError};
+    use crate::{Message, MsgFromUtf8PaketError, TextValidityError};
 
     #[test]
     fn test_text_validity() {
@@ -283,8 +362,8 @@ mod test {
             .map(|_num| 'a')
             .collect::<String>();
 
-        let invalid_chars_text_1 = format!("{}", char::from(Message::TCP_INIT_DELIMITER));
-        let invalid_chars_text_2 = format!("{}", char::from(Message::TCP_END_DELIMITER));
+        let invalid_chars_text_1 = format!("{}", Message::TCP_INIT_DELIMITER_U8 as char);
+        let invalid_chars_text_2 = format!("{}", Message::TCP_END_DELIMITER_U8 as char);
 
         assert_eq!(
             Message::new(&valid_name, &valid_content),
@@ -315,5 +394,60 @@ mod test {
         assert_eq!(Message::has_invalid_chars(&invalid_chars_text_1), true);
         assert_eq!(Message::has_invalid_chars(&invalid_chars_text_2), true);
         assert_eq!(Message::has_invalid_chars(&valid_name), false);
+    }
+
+    #[test]
+    fn utf8paket2msg() -> Result<(), Box<dyn std::error::Error>> {
+        let valid_name = (1..=Message::MAX_USERNAME_LEN)
+            .map(|_num| 'a')
+            .collect::<String>();
+        let valid_content = (1..=Message::MAX_CONTENT_LEN)
+            .map(|_num| 'a')
+            .collect::<String>();
+
+        let valid_msg = Message::new(&valid_name, &valid_content)?;
+        let valid_utf8_paket: Vec<_> = valid_msg.clone().string_paket()?.bytes().collect();
+
+        assert_eq!(Message::from_utf8_paket(valid_utf8_paket), Ok(valid_msg));
+
+        let candidate_no_init_delimiter: Vec<_> =
+            format!("aaaaaa{}", Message::TCP_END_DELIMITER_U8 as char)
+                .bytes()
+                .collect();
+        let candidate_no_end_delimiter: Vec<_> =
+            format!("{}aaaaaa", Message::TCP_INIT_DELIMITER_U8 as char)
+                .bytes()
+                .collect();
+        let candidate_not_valid_serialised_msg: Vec<_> = format!(
+            "{}aaaa{}",
+            Message::TCP_INIT_DELIMITER_U8 as char,
+            Message::TCP_END_DELIMITER_U8 as char
+        )
+        .bytes()
+        .collect();
+
+        assert_eq!(
+            Message::from_utf8_paket(candidate_no_init_delimiter.clone()),
+            Err(MsgFromUtf8PaketError::NoInitDelimiter {
+                candidate: candidate_no_init_delimiter
+            })
+        );
+        assert_eq!(
+            Message::from_utf8_paket(candidate_no_end_delimiter.clone()),
+            Err(MsgFromUtf8PaketError::NoEndDelimiter {
+                candidate: candidate_no_end_delimiter
+            })
+        );
+        assert_eq!(
+            Message::from_utf8_paket(candidate_not_valid_serialised_msg),
+            Err(MsgFromUtf8PaketError::SerdeJson {
+                dispaketed_candidate: "aaaa".to_string(),
+                category: serde_json::error::Category::Syntax,
+                io_error_kind: None,
+                line: 1,
+                column: 1
+            })
+        );
+        Ok(())
     }
 }
