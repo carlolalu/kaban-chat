@@ -6,17 +6,20 @@ use tokio::{
 
 use tokio_stream::StreamExt;
 
-// ########################################
+use thiserror::Error;
+
+// ############################## CONSTANTS ##############################
+
 pub mod constant {
     pub const SERVER_ADDR: &str = "127.0.0.1:6440";
     pub const MAX_NUM_USERS: usize = 2000;
 }
 
-// ########################################
+// ############################## STRUCTS ##############################
 
 /// Message is the type of packet unit that the client uses. They comprehend a username of at most
 /// MAX_USERNAME_LEN chars and a content of at most MAX_CONTENT_LEN chars.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Message {
     username: String,
     content: String,
@@ -51,22 +54,46 @@ impl Message {
         }
     }
 
-    pub fn new(username: &str, content: &str) -> Message {
-        if username.len() > Message::MAX_USERNAME_LEN || Self::has_invalid_chars(username) {
-            panic!("username not valid: too long or invalid chars");
+    pub fn new(username: &str, content: &str) -> Result<Message, TextValidityError> {
+        if username.len() > Message::MAX_USERNAME_LEN {
+            return Err(TextValidityError::TooLong {
+                kind_of_entity: "username".to_string(),
+                actual_entity: username.to_string(),
+                max_len: Message::MAX_USERNAME_LEN,
+                actual_len: username.len(),
+            });
         }
 
-        if content.len() > Message::MAX_CONTENT_LEN || Self::has_invalid_chars(content) {
-            panic!("content not valid: too long or invalid chars");
+        if content.len() > Message::MAX_CONTENT_LEN {
+            return Err(TextValidityError::TooLong {
+                kind_of_entity: "content".to_string(),
+                actual_entity: content.to_string(),
+                max_len: Message::MAX_CONTENT_LEN,
+                actual_len: content.len(),
+            });
         }
 
-        Message {
+        if Self::has_invalid_chars(username) {
+            return Err(TextValidityError::InvalidChars {
+                kind_of_entity: "username".to_string(),
+                actual_entity: username.to_string(),
+            });
+        }
+
+        if Self::has_invalid_chars(content) {
+            return Err(TextValidityError::InvalidChars {
+                kind_of_entity: "content".to_string(),
+                actual_entity: content.to_string(),
+            });
+        }
+
+        Ok(Message {
             username: username.to_string(),
             content: content.to_string(),
-        }
+        })
     }
 
-    pub fn many_new(username: &str, text: &str) -> Vec<Message> {
+    pub fn many_try_new(username: &str, text: &str) -> Vec<Result<Message, TextValidityError>> {
         let msgs: Vec<_> = text
             .chars()
             .collect::<Vec<_>>()
@@ -85,15 +112,35 @@ impl Message {
         self.content.clone()
     }
 
-    pub fn paket(self) -> String {
-        let serialized = serde_json::to_string(&self).unwrap();
+    pub fn paket(self) -> Result<String, serde_json::Error> {
+        let serialized = serde_json::to_string(&self)?;
         let paketed = format!(
             "{}{serialized}{}",
             Message::TCP_INIT_DELIMITER,
             Message::TCP_END_DELIMITER
         );
-        paketed
+        Ok(paketed)
     }
+}
+
+#[derive(Error, Debug, PartialEq)]
+pub enum TextValidityError {
+    #[error(r##"Too long {kind_of_entity} (expected at most {max_len} chars, found {actual_len}): [[{actual_entity}]]"##)]
+    TooLong {
+        kind_of_entity: String,
+        actual_entity: String,
+        max_len: usize,
+        actual_len: usize,
+    },
+    #[error(
+        r##"Invalid chars found in {kind_of_entity} (invalid chars: '{}','{}'): [[{actual_entity}]]"##,
+        Message::TCP_INIT_DELIMITER,
+        Message::TCP_END_DELIMITER
+    )]
+    InvalidChars {
+        kind_of_entity: String,
+        actual_entity: String,
+    },
 }
 
 /// Dispatch is the type of packet unit used exclusively by the server. It associates a message
@@ -118,6 +165,8 @@ impl Dispatch {
         self.userid
     }
 }
+
+// ############################## ASYNC READ FUNCTION ##############################
 
 /// This function reads messages from a Reader and forward them through its channel.
 pub async fn handle_msgs_reader(
@@ -209,5 +258,62 @@ pub async fn handle_msgs_reader(
             }
             Ok(_zero) => break 'process_reader,
         }
+    }
+}
+
+// ############################## TEST ##############################
+
+#[cfg(test)]
+mod test {
+    use crate::{Message, TextValidityError};
+
+    #[test]
+    fn test_text_validity() {
+        let valid_name = (1..=Message::MAX_USERNAME_LEN)
+            .map(|_num| 'a')
+            .collect::<String>();
+        let valid_content = (1..=Message::MAX_CONTENT_LEN)
+            .map(|_num| 'a')
+            .collect::<String>();
+
+        let too_long_name = (1..=Message::MAX_USERNAME_LEN + 1)
+            .map(|_num| 'a')
+            .collect::<String>();
+        let too_long_content = (1..=Message::MAX_CONTENT_LEN + 1)
+            .map(|_num| 'a')
+            .collect::<String>();
+
+        let invalid_chars_text_1 = format!("{}", char::from(Message::TCP_INIT_DELIMITER));
+        let invalid_chars_text_2 = format!("{}", char::from(Message::TCP_END_DELIMITER));
+
+        assert_eq!(
+            Message::new(&valid_name, &valid_content),
+            Ok(Message {
+                username: valid_name.clone(),
+                content: valid_content.clone()
+            })
+        );
+        assert_eq!(
+            Message::new(&valid_name, &too_long_content),
+            Err(TextValidityError::TooLong {
+                kind_of_entity: "content".to_string(),
+                actual_entity: too_long_content.to_string(),
+                max_len: Message::MAX_CONTENT_LEN,
+                actual_len: too_long_content.len()
+            })
+        );
+        assert_eq!(
+            Message::new(&too_long_name, &valid_content),
+            Err(TextValidityError::TooLong {
+                kind_of_entity: "username".to_string(),
+                actual_entity: too_long_name.to_string(),
+                max_len: Message::MAX_USERNAME_LEN,
+                actual_len: too_long_name.len()
+            })
+        );
+
+        assert_eq!(Message::has_invalid_chars(&invalid_chars_text_1), true);
+        assert_eq!(Message::has_invalid_chars(&invalid_chars_text_2), true);
+        assert_eq!(Message::has_invalid_chars(&valid_name), false);
     }
 }
