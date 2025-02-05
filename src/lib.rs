@@ -347,8 +347,21 @@ pub mod test {
     use crate::{Message, MsgFromUtf8PaketError, TextValidityError};
 
 
-    pub fn craft_random_valid_text(char_length: usize) -> Message {
-        todo!();
+    pub fn craft_random_valid_text(char_length: usize) -> String {
+        use rand::prelude::*;
+        use rand::distr::StandardUniform;
+
+        let val: char = rand::rng().sample(StandardUniform);
+        println!("char: {}", val);
+
+        let random_char_iterator: Vec<char> = rand::rng().sample_iter(StandardUniform).take(char_length).collect();
+        //let random_string: String = .map(char::from).collect();
+
+
+        // I still must filter everything which is invalid!!!
+        println!("{}", random_string);
+
+        random_string
     }
 
     pub fn craft_random_msg(username: &str) -> Message {
