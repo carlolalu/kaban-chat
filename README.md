@@ -4,7 +4,32 @@ A chat made in Rust to practice my skills
 
 ## Developer's Guide
 
-The server and the clients are exchanging Message(s), i.e. structs `struct Message { username: String, content: String, }`. The server has a structure of this kind:
+
+
+### lib.rs
+
+The library documentation itsself should be quite self-explaining, a part for the term 'Paket' (and the derived term). A paket is what I call a Message **serialised with serde and enclosed by the `Message::TCP_<INIT/END>_DELIMITER_U8 as char`**. I call Paket interchangeably both the string version and the u8 version (i.e. in bytes) of it, but usually I specify this as "string_paket" or as "utf8_paket".
+
+Regarding the errors: the choice had to be made between generic ones which could easily be converted (on the trace of the `anyhow` crate) or a bit more precise ones (on the trace of the `thiserror` crate). The choice fell on the latter one.
+
+- `lib.rs`:
+  - `enum TextValidityError`
+    - TooLong
+    - InvalidChars
+  - `enum MsgFromUtf8PaketError`
+    - NoInitDelimiter
+    - NoEndDelimiter
+    - SerdeJson
+    - StringFromUtf8
+    - EmptyPaket
+  - `enum MsgReaderError`
+    - conversion from various underlying errors
+    - EmptyEntity
+
+
+### The server and client architecture
+
+The server and the clients are exchanging Message(s), i.e. structs `struct Message { username: String, content: String, }`. In the server such Messages are then wrapped in a `struct Dispatch { userid: integer, msg: Message, }`. The server and the client have together this structure:
 
 ```mermaid
 flowchart TB
@@ -43,29 +68,9 @@ flowchart TB
     end
 ```
 
-### Error types
-
-The choice had to be made between generic errors which could easily be converted (on the trace of the `anyhow` crate) or a bit more precise errors (on the trace of the `thiserror` crate). The choice fell on the latter one.
-
-- `lib.rs`:
-  - `enum TextValidityError`
-    - TooLong
-    - InvalidChars
-  - `enum MsgFromUtf8PaketError`
-    - NoInitDelimiter
-    - NoEndDelimiter
-    - SerdeJson
-    - StringFromUtf8
-    - EmptyPaket
-  - `enum MsgReaderError`
-    - conversion from various underlying errors
-    - EmptyEntity
-
-
 ## Notes for me
 
 - test: you should write quite a lot of unit tests
 - implement error_handling: write your own errors or convert with anyhow crate? (search for `panic` and `unwrap`)
-
 - graceful shutdown: add the id pool and recall to check for the id_pool token redemption
 - id pool: it could be sharded to avoid bottlenecks if many client_handlers must access the same resource.
