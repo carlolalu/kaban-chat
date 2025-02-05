@@ -7,7 +7,7 @@ use tokio::{
 
 use tokio_stream::StreamExt;
 
-use crate::MsgFromUtf8PaketError::SerdeJson;
+use crate::MsgFromPaketError::SerdeJson;
 use thiserror::Error;
 
 // ############################## CONSTANTS ##############################
@@ -28,10 +28,10 @@ pub struct Message {
 }
 
 impl Message {
-    /// The delimiters to send serialised Messages in TCP connections. They are required to be
-    /// different from '{', '}', and to be different from each others.
-    pub(crate) const TCP_INIT_DELIMITER_U8: u8 = b'|';
-    pub(crate) const TCP_END_DELIMITER_U8: u8 = b'`';
+    /// The delimiters to send serialised Messages in bytes through TCP connections. They are NOT appearing in any
+    /// utf8 char as a byte (source: Wikipedia), thus the text does not need to be checked for their presence.
+    pub(crate) const PAKET_INIT_U8: u8 = 0xC0;
+    pub(crate) const PAKET_END_U8: u8 = 0xC1;
 
     /// Maximal length (in chars) of the username.
     pub const MAX_USERNAME_LEN: usize = 32;
@@ -39,7 +39,7 @@ impl Message {
     /// Maximal length (in chars) of the content of the message.
     pub const MAX_CONTENT_LEN: usize = 256;
 
-    /// Maximal length (in bytes) of a paketed message (=JSON serialised message sorrounded by the delimiters)
+    /// Maximal length of a paketed message (=JSON serialised message **in bytes** sorrounded by the <init/end> paket bytes)
     ///
     /// The reasoning is that if the serialised message contains a special character (e.g. '{') at every
     /// (utf8-)char of the username and at every (utf8-)char of the content, and if such char
@@ -60,25 +60,6 @@ impl Message {
         max_serialised_msg_u8_len + delimiters_u8_len
     };
 
-    pub fn has_invalid_chars(text: &str) -> bool {
-        assert_ne!(
-            Message::TCP_INIT_DELIMITER_U8,
-            Message::TCP_END_DELIMITER_U8
-        );
-        assert_ne!(Message::TCP_INIT_DELIMITER_U8, b'{');
-        assert_ne!(Message::TCP_INIT_DELIMITER_U8, b'}');
-        assert_ne!(Message::TCP_END_DELIMITER_U8, b'{');
-        assert_ne!(Message::TCP_END_DELIMITER_U8, b'}');
-
-        if text.contains(Message::TCP_INIT_DELIMITER_U8 as char)
-            || text.contains(Message::TCP_END_DELIMITER_U8 as char)
-        {
-            true
-        } else {
-            false
-        }
-    }
-
     pub fn new(username: &str, content: &str) -> Result<Message, TextValidityError> {
         if username.chars().count() > Message::MAX_USERNAME_LEN {
             return Err(TextValidityError::TooLong {
@@ -95,20 +76,6 @@ impl Message {
                 actual_entity: content.to_string(),
                 max_len: Message::MAX_CONTENT_LEN,
                 actual_len: content.chars().count(),
-            });
-        }
-
-        if Self::has_invalid_chars(username) {
-            return Err(TextValidityError::InvalidChars {
-                kind_of_entity: "username".to_string(),
-                actual_entity: username.to_string(),
-            });
-        }
-
-        if Self::has_invalid_chars(content) {
-            return Err(TextValidityError::InvalidChars {
-                kind_of_entity: "content".to_string(),
-                actual_entity: content.to_string(),
             });
         }
 
@@ -137,27 +104,31 @@ impl Message {
         self.content.clone()
     }
 
-    pub fn string_paket(self) -> Result<String, serde_json::Error> {
-        let serialized = serde_json::to_string(&self)?;
-        let paketed = format!(
-            "{}{serialized}{}",
-            Message::TCP_INIT_DELIMITER_U8 as char,
-            Message::TCP_END_DELIMITER_U8 as char
-        );
-        Ok(paketed)
+    pub fn paket(self) -> Result<Vec<u8>, serde_json::Error> {
+        let serialized_in_bytes: Vec<u8> = serde_json::to_string(&self)?
+            .as_bytes()
+            .into_iter()
+            .map(|&byte| byte)
+            .collect();
+        let paket: Vec<u8> = [Message::PAKET_INIT_U8]
+            .into_iter()
+            .chain(serialized_in_bytes)
+            .chain([Message::PAKET_END_U8].into_iter())
+            .collect();
+        Ok(paket)
     }
 
-    fn from_utf8_paket(candidate: Vec<u8>) -> Result<Message, MsgFromUtf8PaketError> {
+    fn from_paket(candidate: Vec<u8>) -> Result<Message, MsgFromPaketError> {
         match candidate.first() {
-            Some(&byte) if byte == Message::TCP_INIT_DELIMITER_U8 => (),
-            Some(&_byte) => return Err(MsgFromUtf8PaketError::NoInitDelimiter { candidate }),
-            None => return Err(MsgFromUtf8PaketError::EmptyPaket),
+            Some(&byte) if byte == Message::PAKET_INIT_U8 => (),
+            Some(&_byte) => return Err(MsgFromPaketError::NoInitDelimiter { candidate }),
+            None => return Err(MsgFromPaketError::EmptyPaket),
         };
 
         match candidate.last() {
-            Some(&byte) if byte == Message::TCP_END_DELIMITER_U8 => (),
-            Some(&_byte) => return Err(MsgFromUtf8PaketError::NoEndDelimiter { candidate }),
-            None => return Err(MsgFromUtf8PaketError::EmptyPaket),
+            Some(&byte) if byte == Message::PAKET_END_U8 => (),
+            Some(&_byte) => return Err(MsgFromPaketError::NoEndDelimiter { candidate }),
+            None => return Err(MsgFromPaketError::EmptyPaket),
         };
 
         let dispaketed = candidate[1..candidate.len() - 1].to_vec();
@@ -190,30 +161,21 @@ pub enum TextValidityError {
         max_len: usize,
         actual_len: usize,
     },
-    #[error(
-        r##"Invalid chars found in {kind_of_entity} (invalid chars: '{}','{}'): [[{actual_entity}]]."##,
-        Message::TCP_INIT_DELIMITER_U8 as char,
-        Message::TCP_END_DELIMITER_U8 as char
-    )]
-    InvalidChars {
-        kind_of_entity: String,
-        actual_entity: String,
-    },
 }
 
 #[derive(Error, Debug, PartialEq)]
 #[error(transparent)]
-pub enum MsgFromUtf8PaketError {
+pub enum MsgFromPaketError {
     #[error(
-        r##"No init delimiter ({}) found in the utf8 sample. The sample is: [[{candidate:?}]]."##,
-        Message::TCP_INIT_DELIMITER_U8 as char
+        r##"No paket init byte delimiter ({}) found in the utf8 sample. The sample is: [[{candidate:?}]]."##,
+        Message::PAKET_INIT_U8 as char
     )]
     NoInitDelimiter {
         candidate: Vec<u8>,
     },
     #[error(
-        r##"No end delimiter ({}) found in the utf8 sample. The sample is: [[{candidate:?}]]."##,
-        Message::TCP_END_DELIMITER_U8 as char
+        r##"No paket end byte delimiter ({}) found in the utf8 sample. The sample is: [[{candidate:?}]]."##,
+        Message::PAKET_END_U8 as char
     )]
     NoEndDelimiter {
         candidate: Vec<u8>,
@@ -257,11 +219,11 @@ impl Dispatch {
 // ############################## ASYNC READ FUNCTION ##############################
 
 /// This function reads messages from a Reader and forward them through its channel.
-pub async fn handle_msgs_reader(
-    mut reader: impl AsyncRead + Unpin + Send + 'static,
-    tx: sync::mpsc::Sender<Result<Message, MsgFromUtf8PaketError>>,
+pub async fn message_depaketer(
+    mut tcp_reader: impl AsyncRead + Unpin + Send + 'static,
+    tx: sync::mpsc::Sender<Result<Message, MsgFromPaketError>>,
     // cancellation token
-) -> Result<(), MsgReaderError> {
+) -> Result<(), MsgDepaketerError> {
     let msgs_per_buffer = 10_usize;
 
     let mut buffer: Vec<u8> = Vec::with_capacity(Message::MAX_PAKETED_MSG_U8_LEN * msgs_per_buffer);
@@ -269,20 +231,20 @@ pub async fn handle_msgs_reader(
 
     'write_on_buffer: loop {
         buffer.clear();
-        match reader.read_buf(&mut buffer).await {
+        match tcp_reader.read_buf(&mut buffer).await {
             Ok(n) if n > 0 => {
                 // Loop assumption: previous_fragment is initialised (eventually empty)
 
                 let previous_fragment = &mut previous_fragment;
                 let actual_fragments: Vec<&[u8]> = buffer
-                    .split_inclusive(|&byte| byte == Message::TCP_END_DELIMITER_U8)
+                    .split_inclusive(|&byte| byte == Message::PAKET_END_U8)
                     .collect();
 
                 let (first_fragment, actual_fragments) = match actual_fragments.split_first() {
                     Some(smt) => (*smt.0, smt.1),
                     // todo: migliora questo errore
                     None => {
-                        return Err(MsgReaderError::UnusualEmptyEntity {
+                        return Err(MsgDepaketerError::UnusualEmptyEntity {
                             entity: "buffer.split(end_delimiter).split_first()".to_string(),
                         })
                     }
@@ -293,7 +255,7 @@ pub async fn handle_msgs_reader(
                     .chain(first_fragment.iter())
                     .map(|&byte| byte)
                     .collect();
-                let first_msg_result = Message::from_utf8_paket(first_paket_candidate);
+                let first_msg_result = Message::from_paket(first_paket_candidate);
                 tx.send(first_msg_result).await?;
 
                 let (last_fragment, middle_fragments) = match actual_fragments.split_last() {
@@ -303,27 +265,27 @@ pub async fn handle_msgs_reader(
 
                 let mut stream = tokio_stream::iter(middle_fragments);
                 while let Some(&fragment) = stream.next().await {
-                    let msg_result = Message::from_utf8_paket(fragment.to_vec());
+                    let msg_result = Message::from_paket(fragment.to_vec());
                     tx.send(msg_result).await?;
                 }
 
                 // The loop assumptions are fullfilled here
                 match last_fragment.last() {
-                    Some(&ch) if ch == Message::TCP_END_DELIMITER_U8 => {
-                        let last_msg_result = Message::from_utf8_paket(last_fragment.to_vec());
+                    Some(&ch) if ch == Message::PAKET_END_U8 => {
+                        let last_msg_result = Message::from_paket(last_fragment.to_vec());
                         tx.send(last_msg_result).await?;
                         previous_fragment.clear()
                     }
                     Some(&_ch) => *previous_fragment = last_fragment.to_vec(),
                     None => {
-                        return Err(MsgReaderError::UnusualEmptyEntity {
+                        return Err(MsgDepaketerError::UnusualEmptyEntity {
                             entity: "last_fragment.last()".to_string(),
                         })
                     }
                 }
             }
             Ok(_zero) => break 'write_on_buffer,
-            Err(err) => return Err(MsgReaderError::Io(err)),
+            Err(err) => return Err(MsgDepaketerError::Io(err)),
         }
     }
     Ok(())
@@ -331,9 +293,9 @@ pub async fn handle_msgs_reader(
 
 #[derive(Error, Debug)]
 #[error(transparent)]
-pub enum MsgReaderError {
+pub enum MsgDepaketerError {
     Io(#[from] std::io::Error),
-    TxSend(#[from] tokio::sync::mpsc::error::SendError<Result<Message, MsgFromUtf8PaketError>>),
+    TxSend(#[from] tokio::sync::mpsc::error::SendError<Result<Message, MsgFromPaketError>>),
     #[error("Unsual None returned from '{entity}' in 'handle_msgs_reader'.")]
     UnusualEmptyEntity {
         entity: String,
@@ -341,29 +303,15 @@ pub enum MsgReaderError {
 }
 
 pub mod test_util {
-    use rand::Rng;
-
     use crate::*;
 
     pub fn craft_random_valid_text(char_length: usize) -> String {
         use rand::distr::{SampleString, StandardUniform};
 
         let random_string: String = StandardUniform.sample_string(&mut rand::rng(), char_length);
-
-        let random_valid_text: String = random_string
-            .chars()
-            .map(|mut ch| {
-                while ch == Message::TCP_INIT_DELIMITER_U8 as char
-                    || ch == Message::TCP_END_DELIMITER_U8 as char
-                {
-                    ch = rand::rng().sample(StandardUniform);
-                }
-                ch
-            })
-            .collect();
         //println!("random_valid_text: [[[{random_valid_text}]]]");
 
-        random_valid_text
+        random_string
     }
 
     pub fn craft_random_msg(username: &str) -> Message {
@@ -395,9 +343,6 @@ pub mod test {
             .map(|_num| 'a')
             .collect::<String>();
 
-        let invalid_chars_text_1 = format!("{}", Message::TCP_INIT_DELIMITER_U8 as char);
-        let invalid_chars_text_2 = format!("{}", Message::TCP_END_DELIMITER_U8 as char);
-
         assert_eq!(
             Message::new(&valid_name, &valid_content),
             Ok(Message {
@@ -423,10 +368,6 @@ pub mod test {
                 actual_len: too_long_name.chars().count()
             })
         );
-
-        assert_eq!(Message::has_invalid_chars(&invalid_chars_text_1), true);
-        assert_eq!(Message::has_invalid_chars(&invalid_chars_text_2), true);
-        assert_eq!(Message::has_invalid_chars(&valid_name), false);
     }
 
     #[test]
@@ -434,7 +375,6 @@ pub mod test {
         for _ in 0..100 {
             let random_valid_text = test_util::craft_random_valid_text(80);
             assert_eq!(random_valid_text.chars().count(), 80);
-            assert_eq!(Message::has_invalid_chars(&random_valid_text), false);
             // println!("Your random valid text is: [[[{random_valid_text}]]]");
         }
     }
@@ -450,7 +390,7 @@ pub mod test {
     }
 
     #[test]
-    fn utf8paket2msg() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_msg2paket2msg() {
         let valid_name = (1..=Message::MAX_USERNAME_LEN)
             .map(|_num| 'a')
             .collect::<String>();
@@ -458,42 +398,45 @@ pub mod test {
             .map(|_num| 'a')
             .collect::<String>();
 
-        let valid_msg = Message::new(&valid_name, &valid_content)?;
-        let valid_utf8_paket: Vec<_> = valid_msg.clone().string_paket()?.bytes().collect();
+        let valid_msg =
+            Message::new(&valid_name, &valid_content).expect("The message is not valid");
+        let valid_paket = valid_msg.clone().paket().expect("The paket is not valid");
 
-        assert_eq!(Message::from_utf8_paket(valid_utf8_paket), Ok(valid_msg));
+        assert_eq!(Message::from_paket(valid_paket), Ok(valid_msg));
 
-        let candidate_no_init_delimiter: Vec<_> =
-            format!("aaaaaa{}", Message::TCP_END_DELIMITER_U8 as char)
-                .bytes()
-                .collect();
-        let candidate_no_end_delimiter: Vec<_> =
-            format!("{}aaaaaa", Message::TCP_INIT_DELIMITER_U8 as char)
-                .bytes()
-                .collect();
-        let candidate_not_valid_serialised_msg: Vec<_> = format!(
-            "{}aaaa{}",
-            Message::TCP_INIT_DELIMITER_U8 as char,
-            Message::TCP_END_DELIMITER_U8 as char
-        )
-        .bytes()
-        .collect();
+        let random_invalid_string_as_bytes: Vec<u8> =
+            "aaaa".as_bytes().into_iter().map(|&byte| byte).collect();
+
+        let candidate_no_init_delimiter: Vec<_> = random_invalid_string_as_bytes
+            .clone()
+            .into_iter()
+            .chain([Message::PAKET_END_U8])
+            .collect();
+        let candidate_no_end_delimiter: Vec<_> = [Message::PAKET_INIT_U8]
+            .into_iter()
+            .chain(random_invalid_string_as_bytes.clone().into_iter())
+            .collect();
+        let candidate_not_valid_serialised_msg: Vec<u8> = [Message::PAKET_INIT_U8]
+            .into_iter()
+            .chain(random_invalid_string_as_bytes)
+            .chain([Message::PAKET_END_U8].into_iter())
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            Message::from_utf8_paket(candidate_no_init_delimiter.clone()),
-            Err(MsgFromUtf8PaketError::NoInitDelimiter {
+            Message::from_paket(candidate_no_init_delimiter.clone()),
+            Err(MsgFromPaketError::NoInitDelimiter {
                 candidate: candidate_no_init_delimiter
             })
         );
         assert_eq!(
-            Message::from_utf8_paket(candidate_no_end_delimiter.clone()),
-            Err(MsgFromUtf8PaketError::NoEndDelimiter {
+            Message::from_paket(candidate_no_end_delimiter.clone()),
+            Err(MsgFromPaketError::NoEndDelimiter {
                 candidate: candidate_no_end_delimiter
             })
         );
         assert_eq!(
-            Message::from_utf8_paket(candidate_not_valid_serialised_msg),
-            Err(MsgFromUtf8PaketError::SerdeJson {
+            Message::from_paket(candidate_not_valid_serialised_msg),
+            Err(MsgFromPaketError::SerdeJson {
                 dispaketed_candidate: "aaaa".to_string(),
                 category: serde_json::error::Category::Syntax,
                 io_error_kind: None,
@@ -501,35 +444,34 @@ pub mod test {
                 column: 1
             })
         );
-        Ok(())
     }
 
     #[tokio::test]
-    async fn send_messages() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_message_depaketer() {
         let num_messages = 100;
 
-        let paket_bytes: Vec<u8> = (0..num_messages)
+        let paket: Vec<u8> = (0..num_messages)
             .map(|num| {
                 let username = format!("user{}", num);
-                let random_message = test_util::craft_random_msg(&username).unwrap();
+                let random_message = test_util::craft_random_msg(&username);
                 random_message
-                    .string_paket()
-                    .unwrap()
-                    .bytes()
-                    .collect::<Vec<u8>>()
+                    .paket()
+                    .expect("The paketing of a random message failed.")
             })
             .flatten()
             .collect();
 
-        let reader = tokio_test::io::Builder::new().read(&paket_bytes).build();
+        let reader = tokio_test::io::Builder::new().read(&paket).build();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(20);
 
         let task_tracker = TaskTracker::new();
 
         task_tracker.spawn(async move {
-            handle_msgs_reader(reader, tx).await?;
-            Ok::<(), MsgReaderError>(())
+            message_depaketer(reader, tx)
+                .await
+                .expect("The message depaketer failed.");
+            Ok::<(), MsgDepaketerError>(())
         });
 
         task_tracker.spawn(async move {
@@ -546,7 +488,5 @@ pub mod test {
 
         task_tracker.close();
         task_tracker.wait().await;
-
-        Ok(())
     }
 }
