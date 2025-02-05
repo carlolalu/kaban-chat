@@ -33,6 +33,12 @@ impl Message {
     pub(crate) const TCP_INIT_DELIMITER_U8: u8 = b'|';
     pub(crate) const TCP_END_DELIMITER_U8: u8 = b'`';
 
+    // todo: these delimiters here above should be used otherwise: they should ALWAYS be used in 
+    // their byte (u8) versions, because they would become more versaitle thna by keeping them also in text versions. Besides
+    // These would mean to change both their name and all the situations in which they are used `as char`. 
+    // This implies also changing the definition of Paket, both here and in the README. The paket should be a serialised and utf8 encoded message with 
+    // delimiters applied to it
+
     /// Maximal length (in chars) of the username.
     pub const MAX_USERNAME_LEN: usize = 32;
 
