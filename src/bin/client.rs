@@ -53,7 +53,7 @@ async fn connect_and_login() -> (ReadHalf<TcpStream>, WriteHalf<TcpStream>, Stri
         std::io::stdin().read_line(&mut name).unwrap();
         let name = name.trim().to_string();
 
-        if name.len() > Message::MAX_USERNAME_LEN || Message::has_invalid_chars(&name) {
+        if name.chars().count() > Message::MAX_USERNAME_LEN || Message::has_invalid_chars(&name) {
             println!(
                 r###"This username is too long or contains invalid chars! It must not be longer than {} chars!"###,
                 Message::MAX_USERNAME_LEN
@@ -66,10 +66,10 @@ async fn connect_and_login() -> (ReadHalf<TcpStream>, WriteHalf<TcpStream>, Stri
     let stream = TcpStream::connect(constant::SERVER_ADDR).await.unwrap();
     let (tcp_rd, mut tcp_wr) = tokio::io::split(stream);
 
-    let serialized_helo_msg = serde_json::to_string(&Message::new(&name, "helo")).unwrap();
+    let string_paket_of_helo_msg = Message::new(&name, "helo").unwrap().string_paket().unwrap();
 
     tcp_wr
-        .write_all(serialized_helo_msg.as_bytes())
+        .write_all(string_paket_of_helo_msg.as_bytes())
         .await
         .unwrap();
     tcp_wr.flush().await.unwrap();
@@ -105,11 +105,11 @@ where
                     if prompt_buffer.len() > 0 {
                         let text = String::from_utf8(prompt_buffer.clone()).unwrap();
 
-                        let msgs: Vec<Message> = Message::many_new(&name, &text);
-                        let mut msg_stream = tokio_stream::iter(msgs);
+                        let msg_results: Vec<_> = Message::many_try_new(&name, &text);
+                        let mut msg_result_stream = tokio_stream::iter(msg_results);
 
-                        while let Some(msg) = msg_stream.next().await {
-                            tcp_wr.write_all(msg.paket().as_bytes()).await.unwrap();
+                        while let Some(msg_result) = msg_result_stream.next().await {
+                            tcp_wr.write_all(msg_result.unwrap().string_paket().unwrap().as_bytes()).await.unwrap();
                         }
                     }
 
@@ -130,11 +130,12 @@ async fn rd_manager(tcp_rd: impl AsyncRead + Unpin + Send + 'static) {
     let tcp_rd_tracker = TaskTracker::new();
 
     tcp_rd_tracker.spawn(async move {
-        handle_msgs_reader(tcp_rd, msg_tx).await;
+        handle_msgs_reader(tcp_rd, msg_tx).await.unwrap();
     });
 
     tcp_rd_tracker.spawn(async move {
-        let msg = msg_rx.recv().await.unwrap();
+        let msg_result = msg_rx.recv().await.unwrap();
+        let msg = msg_result.unwrap();
         println!("{}:> {}", msg.get_username(), msg.get_content());
     });
 

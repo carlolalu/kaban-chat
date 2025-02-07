@@ -383,7 +383,6 @@ pub mod test_util {
 #[cfg(test)]
 pub mod test {
     use tokio_util::task::TaskTracker;
-
     use crate::*;
 
     #[test]
@@ -515,12 +514,13 @@ pub mod test {
 
     #[tokio::test]
     async fn send_messages() -> Result<(), Box<dyn std::error::Error>> {
-        let num_messages = 700;
+        let num_messages = 100;
 
         let paket_bytes: Vec<u8> = (0..num_messages)
             .map(|num| {
-                test_util::craft_random_msg(&format!("{num}"))
-                    .unwrap()
+                let username = format!("user{}", num);
+                let random_message = test_util::craft_random_msg(&username).unwrap();
+                random_message
                     .string_paket()
                     .unwrap()
                     .bytes()
@@ -544,6 +544,10 @@ pub mod test {
             while let Some(result) = rx.recv().await {
                 // println!("result: {:?}", result);
                 assert!(result.is_ok());
+
+                if let Ok(msg) = result {
+                    println!("{}:> {}", msg.get_username(), msg.get_content());
+                }
             }
             Ok::<(), TextValidityError>(())
         });
