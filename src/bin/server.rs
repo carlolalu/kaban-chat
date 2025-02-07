@@ -8,6 +8,8 @@ use tokio::{self, io, net::TcpStream, sync};
 
 use tokio_util::task::TaskTracker;
 
+use thiserror::Error;
+
 // ############################## MAIN ##############################
 
 #[tokio::main]
@@ -46,12 +48,19 @@ async fn main() {
 async fn dispatcher(
     mut dispatcher_rx: sync::mpsc::Receiver<Dispatch>,
     dispatcher_mic: Arc<sync::broadcast::Sender<Dispatch>>,
-) -> () {
+) -> Result<(), sync::broadcast::error::SendError<Dispatch>> {
     loop {
         if let Some(dispatch) = dispatcher_rx.recv().await {
-            dispatcher_mic.send(dispatch).unwrap();
+            // The broadcast returns an error if there are no subscribers, but the only case in
+            // which a dispatch is received and there are no subscribers is this: graceful shutdown
+            // is implemented, the server has no clients, and is shutting down thus sending the
+            // dispatch "I am shutting down" to all clients. This specific case will be addressed
+            // only when graceful shutdown will be implemented.
+            // todo: when implementing graceful shutdown check here up.
+            dispatcher_mic.send(dispatch)?;
         }
     }
+    Ok(())
 }
 
 /// This function creates a socket and accepts connections on it, spawning for each of them a new
@@ -59,8 +68,8 @@ async fn dispatcher(
 async fn server_manager(
     dispatcher_tx_arc: Arc<sync::broadcast::Sender<Dispatch>>,
     client_handler_tx: sync::mpsc::Sender<Dispatch>,
-) {
-    let listener = TcpListener::bind(constant::SERVER_ADDR).await.unwrap();
+) -> Result<(), tokio::io::Error> {
+    let listener = TcpListener::bind(constant::SERVER_ADDR).await?;
 
     let mut next_user_id: usize = 1;
 
@@ -72,21 +81,34 @@ async fn server_manager(
             or the userid reached its maximum.");
             break;
         }
-        let (stream, addr) = listener.accept().await.unwrap();
+        let (stream, addr) = match listener.accept().await {
+            Ok(connection_data) => connection_data,
+            Err(err) => {
+                eprint_small_error(err);
+                continue;
+            }
+        };
+
         let client_handler_tx = client_handler_tx.clone();
         let dispatcher_subscriber = dispatcher_tx_arc.clone();
 
         let client_handler_rx = dispatcher_subscriber.subscribe();
 
         server_manager_tracker.spawn(async move {
-            client_handler(
+            match client_handler(
                 stream,
                 client_handler_tx,
                 client_handler_rx,
                 addr,
                 next_user_id,
             )
-            .await;
+            .await
+            {
+                Ok(()) => (),
+                Err(err) => {
+                    eprint_small_error(err);
+                }
+            }
         });
 
         next_user_id = next_user_id + 1;
@@ -94,6 +116,8 @@ async fn server_manager(
 
     server_manager_tracker.close();
     server_manager_tracker.wait().await;
+
+    Ok(())
 }
 
 /// The client handler divides the stream into reader and writer, and then spawns two tasks handling them.
@@ -103,7 +127,7 @@ async fn client_handler(
     client_handler_rx: sync::broadcast::Receiver<Dispatch>,
     _addr: std::net::SocketAddr,
     userid: usize,
-) {
+) -> Result<(), ClientHandlerError> {
     let client_handler_task_manager = TaskTracker::new();
 
     let (tcp_rd, tcp_wr) = io::split(stream);
@@ -118,42 +142,66 @@ async fn client_handler(
 
     client_handler_task_manager.close();
     client_handler_task_manager.wait().await;
+
+    Ok(())
+}
+
+#[derive(Error, Debug, PartialEq)]
+enum ClientHandlerError {
+    #[error("The 'client_tcp_wr_loop' died because of this error: ")]
+    TrialError,
 }
 
 async fn client_tcp_wr_loop(
     mut tcp_wr: impl AsyncWrite + Unpin,
     mut client_handler_rx: sync::broadcast::Receiver<Dispatch>,
     userid: usize,
-) {
+) -> Result<(), tokio::io::Error> {
     loop {
-        let dispatch = client_handler_rx.recv().await.unwrap();
+        let dispatch = client_handler_rx
+            .recv()
+            .await
+            .expect("The client wr loop could not receive the dispatch from the dipatcher");
 
         if dispatch.get_userid() != userid {
-            let serialized_msg = serde_json::to_string(&dispatch.into_msg()).unwrap();
-            tcp_wr.write_all(serialized_msg.as_bytes()).await.unwrap();
+            tcp_wr.write_all(&dispatch.get_bytes()).await?;
         }
     }
+
+    // todo: take away with graceful shutdown
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 async fn client_tcp_rd_loop(
     tcp_rd: impl AsyncRead + Unpin + Send + 'static,
     client_handler_tx: sync::mpsc::Sender<Dispatch>,
     userid: usize,
-) {
-    let (msg_tx, mut msg_rx) = sync::mpsc::channel(10);
+) -> Result<(), tokio::io::Error> {
+    // TODO no magic numbers
+    let (pakets_tx, mut pakets_rx) = sync::mpsc::channel(300);
 
     let tcp_rd_tracker = TaskTracker::new();
 
     tcp_rd_tracker.spawn(async move {
-        handle_msgs_reader(tcp_rd, msg_tx).await;
+        // todo: use this result
+        let _result = pakets_extractor(tcp_rd, pakets_tx).await;
     });
 
     tcp_rd_tracker.spawn(async move {
-        let msg = msg_rx.recv().await.unwrap();
-        let dispatch = Dispatch::new(userid, msg);
-        client_handler_tx.send(dispatch).await.unwrap();
+        loop {
+            if let Some(bytes) = pakets_rx.recv().await {
+                let dispatch = Dispatch::new(userid, bytes);
+                client_handler_tx
+                    .send(dispatch)
+                    .await
+                    .expect("this error must still be properly defined");
+            }
+        }
     });
 
     tcp_rd_tracker.close();
     tcp_rd_tracker.wait().await;
+
+    Ok(())
 }
