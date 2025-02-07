@@ -140,6 +140,7 @@ async fn client_tcp_rd_loop(
     client_handler_tx: sync::mpsc::Sender<Dispatch>,
     userid: usize,
 ) {
+    // let us now leave this commit empty please TODO
     let (msg_tx, mut msg_rx) = sync::mpsc::channel(10);
 
     let tcp_rd_tracker = TaskTracker::new();
@@ -150,10 +151,13 @@ async fn client_tcp_rd_loop(
 
     tcp_rd_tracker.spawn(async move {
         let msg = msg_rx.recv().await.unwrap();
-        let dispatch = Dispatch::new(userid, msg);
+        let dispatch = Dispatch::new(userid, msg.unwrap());
         client_handler_tx.send(dispatch).await.unwrap();
     });
 
     tcp_rd_tracker.close();
     tcp_rd_tracker.wait().await;
 }
+
+#[cfg(test)]
+mod test {}
