@@ -2,15 +2,12 @@ use kaban_chat::*;
 
 use std::io::Write;
 
-use serde_json;
-
 use tokio::{
     self,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
     sync,
 };
-use tokio_stream::StreamExt;
 
 use tokio_util::task::TaskTracker;
 
@@ -53,9 +50,9 @@ async fn connect_and_login() -> (ReadHalf<TcpStream>, WriteHalf<TcpStream>, Stri
         std::io::stdin().read_line(&mut name).unwrap();
         let name = name.trim().to_string();
 
-        if name.len() > Message::MAX_USERNAME_LEN || Message::has_invalid_chars(&name) {
+        if name.chars().count() > Message::MAX_USERNAME_LEN {
             println!(
-                r###"This username is too long or contains invalid chars! It must not be longer than {} chars!"###,
+                r###"This username is too long! It must not be longer than {} chars!"###,
                 Message::MAX_USERNAME_LEN
             );
         } else {
@@ -66,61 +63,66 @@ async fn connect_and_login() -> (ReadHalf<TcpStream>, WriteHalf<TcpStream>, Stri
     let stream = TcpStream::connect(constant::SERVER_ADDR).await.unwrap();
     let (tcp_rd, mut tcp_wr) = tokio::io::split(stream);
 
-    let serialized_helo_msg = serde_json::to_string(&Message::new(&name, "helo")).unwrap();
+    let paket_of_helo_msg = Message::new(&name, "helo").unwrap().paket().unwrap();
 
-    tcp_wr
-        .write_all(serialized_helo_msg.as_bytes())
-        .await
-        .unwrap();
+    tcp_wr.write_all(&paket_of_helo_msg).await.unwrap();
     tcp_wr.flush().await.unwrap();
 
     (tcp_rd, tcp_wr, name.to_string())
 }
 
 /// Writes text into the prompt and packs it into messages. Then sends such messages to the server connection.
-async fn wr_manager<Wr, Rd>(mut tcp_wr: Wr, mut stdin: Rd, name: &str) -> ()
+async fn wr_manager<Wr, Rd>(mut tcp_wr: Wr, mut stdin: Rd, username: &str) -> ()
 where
     Wr: AsyncWrite + Unpin,
     Rd: AsyncRead + Unpin,
 {
-    // The choice of buffer_len as Message::MAX_CONTENT_LEN might be algorithmically practical but
-    // maybe computationally less efficient, even though here it is not an issue.
-    let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::MAX_CONTENT_LEN * 10);
+    let task_tracker = TaskTracker::new();
 
-    'new_prompt: loop {
-        print!("\n{name}:> ");
-        std::io::stdout().flush().unwrap();
+    // todo: adjust this magic number
+    let (tx_paketer, rx_paketer) = tokio::sync::mpsc::channel(20);
 
-        '_process_prompt: loop {
-            prompt_buffer.clear();
-            match stdin.read_buf(&mut prompt_buffer).await {
-                Ok(n) if n > 0 => {
-                    let is_last_chunk = if prompt_buffer.last() == Some(&b'\n') {
-                        prompt_buffer.pop();
-                        true
-                    } else {
-                        false
-                    };
+    task_tracker.spawn(async move {
+        // todo: avoid unwrap
+        message_paketer(tcp_wr, rx_paketer, username).await.unwrap();
+    });
 
-                    if prompt_buffer.len() > 0 {
+
+        // The choice of buffer_len as Message::MAX_CONTENT_LEN might be algorithmically practical but
+        // maybe computationally less efficient, even though here it is not an issue.
+        let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::MAX_CONTENT_LEN * 10);
+
+        'new_prompt: loop {
+            print!("\n{username}:> ");
+            std::io::stdout().flush().unwrap();
+
+            '_process_prompt: loop {
+                prompt_buffer.clear();
+                match stdin.read_buf(&mut prompt_buffer).await {
+                    Ok(n) if n > 0 => {
+                        let is_last_chunk = if prompt_buffer.last() == Some(&b'\n') {
+                            prompt_buffer.pop();
+                            true
+                        } else {
+                            false
+                        };
+
                         let text = String::from_utf8(prompt_buffer.clone()).unwrap();
+                        tx_paketer.send(text).await.unwrap();
 
-                        let msgs: Vec<Message> = Message::many_new(&name, &text);
-                        let mut msg_stream = tokio_stream::iter(msgs);
-
-                        while let Some(msg) = msg_stream.next().await {
-                            tcp_wr.write_all(msg.paket().as_bytes()).await.unwrap();
+                        if is_last_chunk {
+                            continue 'new_prompt;
                         }
                     }
-
-                    if is_last_chunk {
-                        continue 'new_prompt;
-                    }
+                    Ok(_) | _ => panic!(),
                 }
-                Ok(_) | _ => panic!(),
             }
         }
-    }
+
+    task_tracker.close();
+    task_tracker.wait().await;
+
+
 }
 
 /// Receives messages from the server and prints them in the stdin
@@ -130,14 +132,21 @@ async fn rd_manager(tcp_rd: impl AsyncRead + Unpin + Send + 'static) {
     let tcp_rd_tracker = TaskTracker::new();
 
     tcp_rd_tracker.spawn(async move {
-        handle_msgs_reader(tcp_rd, msg_tx).await;
+        message_depaketer(tcp_rd, msg_tx).await.unwrap();
     });
 
     tcp_rd_tracker.spawn(async move {
-        let msg = msg_rx.recv().await.unwrap();
+        let msg_result = msg_rx.recv().await.unwrap();
+        let msg = msg_result.unwrap();
         println!("{}:> {}", msg.get_username(), msg.get_content());
     });
 
     tcp_rd_tracker.close();
     tcp_rd_tracker.wait().await;
+}
+
+#[cfg(test)]
+mod test {
+    // #[test]
+    // fn
 }
