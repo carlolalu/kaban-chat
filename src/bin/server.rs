@@ -141,7 +141,7 @@ async fn client_tcp_rd_loop(
     userid: usize,
 ) {
 
-    
+
     let (msg_tx, mut msg_rx) = sync::mpsc::channel(10);
 
     let tcp_rd_tracker = TaskTracker::new();
@@ -158,4 +158,10 @@ async fn client_tcp_rd_loop(
 
     tcp_rd_tracker.close();
     tcp_rd_tracker.wait().await;
+}
+
+
+#[cfg(test)]
+mod test {
+
 }
