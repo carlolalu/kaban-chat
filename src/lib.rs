@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync,
 };
+
+use std::io::Write;
 
 use tokio_stream::StreamExt;
 
@@ -302,6 +304,88 @@ pub enum MsgDepaketerError {
     },
 }
 
+// ############################## ASYNC WRITE FUNCTION ##############################
+
+/// This function reads from the stdin with a 'prompt_buffer', stringify the result, packs it into
+/// many different messages with the given username and sends them through the tcp_writer.
+pub async fn message_paketer(
+    mut stdout: impl Write,
+    mut stdin: impl AsyncRead + Unpin,
+    mut tcp_writer: impl AsyncWrite + Unpin,
+    username: &str,
+    // cancellation_token: CancellationToken
+) -> Result<(), MsgPaketerError> {
+    let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::MAX_CONTENT_LEN);
+
+    'accepting_new_prompt: loop {
+        write!(stdout, "\n{username}:> ")?;
+        stdout.flush()?;
+
+        'processing_prompt_buffer: loop {
+            prompt_buffer.clear();
+
+            let result = stdin.read_buf(&mut prompt_buffer).await;
+
+            match result {
+                Ok(n) if n > 0 => {
+                    let is_last_chunk = if prompt_buffer.last() == Some(&b'\n') {
+                        prompt_buffer.pop();
+                        true
+                    } else {
+                        false
+                    };
+
+                    if prompt_buffer.len() == 0 {
+                        continue 'accepting_new_prompt;
+                    }
+
+                    let text = String::from_utf8(prompt_buffer.clone())?;
+
+                    let msg_results: Vec<Result<Message, TextValidityError>> = text
+                        .chars()
+                        .collect::<Vec<char>>()
+                        .chunks(Message::MAX_CONTENT_LEN)
+                        .map(|char_slice| String::from_iter(char_slice))
+                        .map(|content| Message::new(username, &content))
+                        .collect();
+
+                    let mut msg_result_stream = tokio_stream::iter(msg_results);
+
+                    while let Some(msg_result) = msg_result_stream.next().await {
+                        // todo: handle better such error, like writing what the error is in a message, or similar
+                        let paket = msg_result?.paket()?;
+                        tcp_writer.write_all(&paket).await?;
+                    }
+
+                    if is_last_chunk {
+                        continue 'accepting_new_prompt
+                    } else {
+                        continue 'processing_prompt_buffer
+                    }
+                },
+                Ok(_) | _ => {result?;}
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Error, Debug)]
+#[error(transparent)]
+pub enum MsgPaketerError {
+    Io(#[from] std::io::Error),
+    TxReceive(#[from] tokio::sync::mpsc::error::TryRecvError),
+    #[error("Unsual None returned from '{entity}' in 'handle_msgs_reader'.")]
+    UnusualEmptyEntity {
+        entity: String,
+    },
+    StringFromUtf8(#[from] std::string::FromUtf8Error),
+    TextValidity(#[from] TextValidityError),
+    SerdeJsonError(#[from] serde_json::Error),
+}
+
+// ############################## TEST UTILITIES ##############################
+
 pub mod test_util {
     use crate::*;
 
@@ -324,7 +408,9 @@ pub mod test_util {
 
 #[cfg(test)]
 pub mod test {
+    use crate::test_util::craft_random_valid_text;
     use crate::*;
+    use tokio::net::TcpStream;
     use tokio_util::task::TaskTracker;
 
     #[test]
@@ -486,5 +572,50 @@ pub mod test {
 
         task_tracker.close();
         task_tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_message_paketer() {
+        let num_messages_prompt = 100;
+
+        let prompt_buffer1 = craft_random_valid_text(Message::MAX_CONTENT_LEN * num_messages_prompt);
+        let prompt_buffer2 = (1..=num_messages_prompt).map(|num| -> Vec<char> {
+            let prefix_len = "MESSAGE_n__[[[]]]".chars().count() + 1_usize + (num as f64).log10().floor() as usize;
+            let msg = format!{"MESSAGE_n_{}_[[[{}]]]", num, craft_random_valid_text(Message::MAX_CONTENT_LEN - prefix_len)};
+            msg.chars().collect()
+        }).flatten().collect::<String>();
+
+        let stdin = tokio_test::io::Builder::new().write(prompt_buffer1.as_bytes()).write(prompt_buffer2.as_bytes()).build();
+        let (tx_depaketer, mut rx_depaketer) = tokio::sync::mpsc::channel(20);
+
+        let test_task_tracker = TaskTracker::new();
+
+        // server
+        test_task_tracker.spawn(async move {
+            let listener = tokio::net::TcpListener::bind(constant::SERVER_ADDR)
+                .await
+                .unwrap();
+            let (socket_stream_server, _addr) = listener.accept().await.unwrap();
+
+            message_depaketer(socket_stream_server, tx_depaketer)
+                .await
+                .unwrap();
+
+            while let Ok(msg) = rx_depaketer.recv().await.unwrap() {
+                println!("{}:> {}", msg.get_username(), msg.get_content());
+            }
+        });
+
+        // client
+        test_task_tracker.spawn(async move {
+            let socket_stream_client = TcpStream::connect(constant::SERVER_ADDR).await.unwrap();
+
+            message_paketer(std::io::stdout(), stdin, socket_stream_client, "peppino")
+                .await
+                .unwrap();
+        });
+
+        test_task_tracker.close();
+        test_task_tracker.wait().await;
     }
 }
