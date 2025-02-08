@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync,
 };
 
@@ -302,6 +302,52 @@ pub enum MsgDepaketerError {
     },
 }
 
+// ############################## ASYNC WRITE FUNCTION ##############################
+
+/// This function receives text chunks of the prompt (without the final character '\n') through a
+/// channel rx, packs them into many different messages with the given username and sends them
+/// through the tcp_writer.
+pub async fn message_paketer(
+    mut tcp_writer: impl AsyncWrite + Unpin,
+    mut rx: sync::mpsc::Receiver<String>,
+    username: &str,
+) -> Result<(), MsgPaketerError> {
+    while let Some(prompt_buffer) = rx.recv().await {
+        let msg_contents: Vec<String> = prompt_buffer
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(Message::MAX_CONTENT_LEN)
+            .map(|char_slice| String::from_iter(char_slice))
+            .collect();
+        let pakets: Vec<Vec<u8>> = msg_contents
+            .iter()
+            .map(|content|
+                // no unwrap here please
+            Message::new(username, content).unwrap().paket().unwrap())
+            .collect();
+
+        let mut paket_stream = tokio_stream::iter(pakets);
+
+        while let Some(paket) = paket_stream.next().await {
+            tcp_writer.write_all(&paket).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Error, Debug)]
+#[error(transparent)]
+pub enum MsgPaketerError {
+    Io(#[from] std::io::Error),
+    TxReceive(#[from] tokio::sync::mpsc::error::TryRecvError),
+    #[error("Unsual None returned from '{entity}' in 'handle_msgs_reader'.")]
+    UnusualEmptyEntity {
+        entity: String,
+    },
+}
+
+// ############################## TEST UTILITIES ##############################
+
 pub mod test_util {
     use crate::*;
 
@@ -324,7 +370,9 @@ pub mod test_util {
 
 #[cfg(test)]
 pub mod test {
+    use crate::test_util::craft_random_valid_text;
     use crate::*;
+    use tokio::net::TcpStream;
     use tokio_util::task::TaskTracker;
 
     #[test]
@@ -488,5 +536,53 @@ pub mod test {
 
         task_tracker.close();
         task_tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_message_paketer() {
+        let (tx_paketer, rx_paketer) = tokio::sync::mpsc::channel(20);
+        let (tx_depaketer, mut rx_depaketer) = tokio::sync::mpsc::channel(20);
+
+        let test_task_tracker = TaskTracker::new();
+
+        // server
+        test_task_tracker.spawn(async move {
+            let listener = tokio::net::TcpListener::bind(constant::SERVER_ADDR)
+                .await
+                .unwrap();
+            let (socket_stream_server, _addr) = listener.accept().await.unwrap();
+
+            message_depaketer(socket_stream_server, tx_depaketer)
+                .await
+                .unwrap();
+        });
+
+        let num_messages_prompt = 100;
+
+        // client
+        test_task_tracker.spawn(async move {
+            let socket_stream_client = TcpStream::connect(constant::SERVER_ADDR).await.unwrap();
+
+            let prompt_buffer1 = craft_random_valid_text(Message::MAX_CONTENT_LEN * num_messages_prompt);
+            let prompt_buffer2 = (1..=num_messages_prompt).map(|num| -> Vec<char> {
+                let prefix_len = "MESSAGE_n__[[[]]]".chars().count() + 1_usize + (num as f64).log10().floor() as usize;
+                format!{"MESSAGE_n_{}_[[[{}]]]", num, craft_random_valid_text(Message::MAX_CONTENT_LEN - prefix_len)}.chars().collect()
+            }).flatten().collect();
+
+            tx_paketer.send(prompt_buffer1).await.unwrap();
+            tx_paketer.send(prompt_buffer2).await.unwrap();
+
+            message_paketer(socket_stream_client, rx_paketer, "peppino")
+                .await
+                .unwrap();
+        });
+
+        for _ in 0..num_messages_prompt * 2 {
+            let msg = rx_depaketer.recv().await.unwrap().unwrap();
+            println!("{}:> {}", msg.get_username(), msg.get_content());
+        }
+
+        test_task_tracker.close();
+        test_task_tracker.wait().await;
     }
 }
