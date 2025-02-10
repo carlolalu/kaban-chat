@@ -72,7 +72,7 @@ async fn connect_and_login() -> (ReadHalf<TcpStream>, WriteHalf<TcpStream>, Stri
 }
 
 /// Writes text into the prompt and packs it into messages. Then sends such messages to the server connection.
-async fn wr_manager<Wr, Rd>(mut tcp_wr: Wr, mut stdin: Rd, username: &str) -> ()
+async fn wr_manager<Wr, Rd>(tcp_wr: Wr, mut stdin: Rd, username: &str) -> ()
 where
     Wr: AsyncWrite + Unpin,
     Rd: AsyncRead + Unpin,
@@ -81,19 +81,16 @@ where
 
     // todo: adjust this magic number
     let (tx_paketer, rx_paketer) = tokio::sync::mpsc::channel(20);
+    let username = std::sync::Arc::new(username);
+    let username_client = username.clone();
 
     task_tracker.spawn(async move {
-        // todo: avoid unwrap
-        message_paketer(tcp_wr, rx_paketer, username).await.unwrap();
-    });
-
-
         // The choice of buffer_len as Message::MAX_CONTENT_LEN might be algorithmically practical but
         // maybe computationally less efficient, even though here it is not an issue.
         let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::MAX_CONTENT_LEN * 10);
 
         'new_prompt: loop {
-            print!("\n{username}:> ");
+            print!("\n{username_client}:> ");
             std::io::stdout().flush().unwrap();
 
             '_process_prompt: loop {
@@ -118,11 +115,13 @@ where
                 }
             }
         }
+    });
+
+    // todo: avoid unwrap
+    message_paketer(tcp_wr, rx_paketer, &username).await.unwrap();
 
     task_tracker.close();
     task_tracker.wait().await;
-
-
 }
 
 /// Receives messages from the server and prints them in the stdin
