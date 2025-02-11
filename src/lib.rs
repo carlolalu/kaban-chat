@@ -309,6 +309,7 @@ pub enum MsgDepaketerError {
 /// This function reads from the stdin with a 'prompt_buffer', stringify the result, packs it into
 /// many different messages with the given username and sends them through the tcp_writer.
 pub async fn message_paketer(
+    // todo: use maybe the stdout of tokio, maybe not in the args
     mut stdout: impl Write,
     mut stdin: impl AsyncRead + Unpin,
     mut tcp_writer: impl AsyncWrite + Unpin,
@@ -318,13 +319,19 @@ pub async fn message_paketer(
     let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::MAX_CONTENT_LEN);
 
     'accepting_new_prompt: loop {
-        write!(stdout, "\n{username}:> ")?;
+        write!(stdout, "{username}:> ")?;
         stdout.flush()?;
 
         'processing_prompt_buffer: loop {
             prompt_buffer.clear();
 
+            // todo: remove debug
+            println!("I reached the processing prompt buffer point.");
+
             let result = stdin.read_buf(&mut prompt_buffer).await;
+
+            // todo: remove debug
+            println!("I reached the point where the stdin has been read.");
 
             match result {
                 Ok(n) if n > 0 => {
@@ -335,11 +342,17 @@ pub async fn message_paketer(
                         false
                     };
 
+                    // todo: remove debug
+                    println!("I reached the point where the result is being processed.");
+
                     if prompt_buffer.len() == 0 {
+                        println!("I am at the point where the buffer has length 0.");
                         continue 'accepting_new_prompt;
                     }
 
                     let text = String::from_utf8(prompt_buffer.clone())?;
+
+                    println!("I reached the point where the result is a String.");
 
                     let msg_results: Vec<Result<Message, TextValidityError>> = text
                         .chars()
@@ -352,21 +365,34 @@ pub async fn message_paketer(
                     let mut msg_result_stream = tokio_stream::iter(msg_results);
 
                     while let Some(msg_result) = msg_result_stream.next().await {
-                        // todo: handle better such error, like writing what the error is in a message, or similar
+
+                        // todo: remove debug
+                        println!("I reached the point inside the async iterator.");
+
                         let paket = msg_result?.paket()?;
                         tcp_writer.write_all(&paket).await?;
                     }
 
+                    // todo: remove debug
+                    println!("I reached the point where I finished processing the first chunk.");
+
                     if is_last_chunk {
-                        continue 'accepting_new_prompt
+                        continue 'accepting_new_prompt;
                     } else {
-                        continue 'processing_prompt_buffer
+                        continue 'processing_prompt_buffer;
                     }
                 },
-                Ok(_) | _ => {result?;}
+                Ok(_) | _ => {
+                    // todo: remove debug
+                    println!("I reached the point where 0 bytes have been read, or an error occured.");
+                    result?;
+                },
             }
         }
     }
+
+    // todo: remove this when adding graceful shutdown
+    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -408,6 +434,7 @@ pub mod test_util {
 
 #[cfg(test)]
 pub mod test {
+    use std::io::stdout;
     use crate::test_util::craft_random_valid_text;
     use crate::*;
     use tokio::net::TcpStream;
@@ -578,15 +605,21 @@ pub mod test {
     async fn test_message_paketer() {
         let num_messages_prompt = 100;
 
-        let prompt_buffer1 = craft_random_valid_text(Message::MAX_CONTENT_LEN * num_messages_prompt);
+        let prompt_buffer1 =
+            craft_random_valid_text(Message::MAX_CONTENT_LEN * num_messages_prompt);
+
         let prompt_buffer2 = (1..=num_messages_prompt).map(|num| -> Vec<char> {
             let prefix_len = "MESSAGE_n__[[[]]]".chars().count() + 1_usize + (num as f64).log10().floor() as usize;
             let msg = format!{"MESSAGE_n_{}_[[[{}]]]", num, craft_random_valid_text(Message::MAX_CONTENT_LEN - prefix_len)};
             msg.chars().collect()
         }).flatten().collect::<String>();
 
-        let stdin = tokio_test::io::Builder::new().write(prompt_buffer1.as_bytes()).write(prompt_buffer2.as_bytes()).build();
-        let (tx_depaketer, mut rx_depaketer) = tokio::sync::mpsc::channel(20);
+        let stdin = tokio_test::io::Builder::new()
+            .read(prompt_buffer1.as_bytes())
+            .read(prompt_buffer2.as_bytes())
+            .build();
+
+        let (tx_depaketer, mut rx_depaketer) = tokio::sync::mpsc::channel::<Result<Message, MsgFromPaketError>>(20);
 
         let test_task_tracker = TaskTracker::new();
 
@@ -594,28 +627,34 @@ pub mod test {
         test_task_tracker.spawn(async move {
             let listener = tokio::net::TcpListener::bind(constant::SERVER_ADDR)
                 .await
-                .unwrap();
-            let (socket_stream_server, _addr) = listener.accept().await.unwrap();
+                .expect("point0");
 
-            message_depaketer(socket_stream_server, tx_depaketer)
-                .await
-                .unwrap();
+            let (socket_stream_server, _addr) = listener.accept().await.expect("point1");
 
-            while let Ok(msg) = rx_depaketer.recv().await.unwrap() {
-                println!("{}:> {}", msg.get_username(), msg.get_content());
-            }
+            message_depaketer(socket_stream_server, tx_depaketer).await.unwrap();
         });
 
         // client
         test_task_tracker.spawn(async move {
-            let socket_stream_client = TcpStream::connect(constant::SERVER_ADDR).await.unwrap();
+            let socket_stream_client = TcpStream::connect(constant::SERVER_ADDR).await.expect("point2");
 
-            message_paketer(std::io::stdout(), stdin, socket_stream_client, "peppino")
-                .await
-                .unwrap();
+            let _stdout_mock = tokio_test::io::Builder::new().read(".aa".as_bytes()).build();
+
+            message_paketer(stdout(), stdin, socket_stream_client, "peppino").await.expect("I just exited the message paketer with an error");
         });
+
+
+        if let Ok(msg) = rx_depaketer.recv().await.expect("something went wrong in the message transmission") {
+            println!("{}:> {}", msg.get_username(), msg.get_content());
+        }
+
+        // todo: remove debug
+        println!("I reached the ALMOST end of the test");
 
         test_task_tracker.close();
         test_task_tracker.wait().await;
+
+        // todo: remove debug
+        println!("I reached the VERY end of the test");
     }
 }
