@@ -331,7 +331,7 @@ pub async fn message_paketer(
             let result = stdin.read_buf(&mut prompt_buffer).await;
 
             // todo: remove debug
-            println!("I reached the point where the stdin has been read.");
+            println!("I reached the point where the stdin has been read. The result of read_buf is: [[[{:?}]]]", result);
 
             match result {
                 Ok(n) if n > 0 => {
@@ -350,7 +350,11 @@ pub async fn message_paketer(
                         continue 'accepting_new_prompt;
                     }
 
-                    let text = String::from_utf8(prompt_buffer.clone())?;
+                    let text_result = String::from_utf8(prompt_buffer.clone());
+
+                    println!("text_result is [[[{:?}]]].", text_result);
+
+                    let text = text_result?;
 
                     println!("I reached the point where the result is a String.");
 
@@ -618,6 +622,8 @@ pub mod test {
             .read(prompt_buffer1.as_bytes())
             .read(prompt_buffer2.as_bytes())
             .build();
+
+        let stdin = tokio::io::BufReader::new(stdin);
 
         let (tx_depaketer, mut rx_depaketer) = tokio::sync::mpsc::channel::<Result<Message, MsgFromPaketError>>(20);
 
