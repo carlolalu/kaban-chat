@@ -106,8 +106,9 @@ impl Message {
         self.content.clone()
     }
 
-    pub fn paket(self) -> Result<Vec<u8>, serde_json::Error> {
-        let serialized_in_bytes: Vec<u8> = serde_json::to_string(&self)?
+    pub fn paket(self) -> Vec<u8> {
+        let serialized_in_bytes: Vec<u8> = serde_json::to_string(&self)
+            .expect("The conversion of Message to its serialised JSON version failed.")
             .as_bytes()
             .into_iter()
             .map(|&byte| byte)
@@ -117,7 +118,7 @@ impl Message {
             .chain(serialized_in_bytes)
             .chain([Message::PAKET_END_U8].into_iter())
             .collect();
-        Ok(paket)
+        paket
     }
 
     fn from_paket(candidate: Vec<u8>) -> Result<Message, MsgFromPaketError> {
@@ -218,7 +219,7 @@ impl Dispatch {
     }
 }
 
-// ############################## ASYNC READ FUNCTION ##############################
+// ############################## ASYNC READ AND WRITE FUNCTIONS ##############################
 
 /// This function reads messages from a Reader and forward them through its channel.
 pub async fn message_depaketer(
@@ -242,13 +243,14 @@ pub async fn message_depaketer(
                     .split_inclusive(|&byte| byte == Message::PAKET_END_U8)
                     .collect();
 
-                let (first_fragment, actual_fragments) = match actual_fragments.split_first() {
+                let (first_fragment, not_first_fragments) = match actual_fragments.split_first() {
                     Some(smt) => (*smt.0, smt.1),
-                    // todo: migliora questo errore
                     None => {
-                        return Err(MsgDepaketerError::UnusualEmptyEntity {
-                            entity: "buffer.split(end_delimiter).split_first()".to_string(),
-                        })
+                        let err = UnusualEmptyEntity {
+                            entity: "actual_fragments".to_string(),
+                        };
+                        eprint_small_error(err);
+                        continue 'write_on_buffer;
                     }
                 };
 
@@ -260,7 +262,7 @@ pub async fn message_depaketer(
                 let first_msg_result = Message::from_paket(first_paket_candidate);
                 tx.send(first_msg_result).await?;
 
-                let (last_fragment, middle_fragments) = match actual_fragments.split_last() {
+                let (last_fragment, middle_fragments) = match not_first_fragments.split_last() {
                     Some(smt) => (*smt.0, smt.1),
                     None => continue 'write_on_buffer,
                 };
@@ -271,7 +273,7 @@ pub async fn message_depaketer(
                     tx.send(msg_result).await?;
                 }
 
-                // The loop assumptions are fullfilled here
+                // The loop assumptions are fulfilled here
                 match last_fragment.last() {
                     Some(&ch) if ch == Message::PAKET_END_U8 => {
                         let last_msg_result = Message::from_paket(last_fragment.to_vec());
@@ -280,9 +282,11 @@ pub async fn message_depaketer(
                     }
                     Some(&_ch) => *previous_fragment = last_fragment.to_vec(),
                     None => {
-                        return Err(MsgDepaketerError::UnusualEmptyEntity {
-                            entity: "last_fragment.last()".to_string(),
-                        })
+                        let err = UnusualEmptyEntity {
+                            entity: "last_fragment".to_string(),
+                        };
+                        eprint_small_error(err);
+                        continue 'write_on_buffer;
                     }
                 }
             }
@@ -298,13 +302,7 @@ pub async fn message_depaketer(
 pub enum MsgDepaketerError {
     Io(#[from] std::io::Error),
     TxSend(#[from] tokio::sync::mpsc::error::SendError<Result<Message, MsgFromPaketError>>),
-    #[error("Unsual None returned from '{entity}' in 'handle_msgs_reader'.")]
-    UnusualEmptyEntity {
-        entity: String,
-    },
 }
-
-// ############################## ASYNC WRITE FUNCTION ##############################
 
 /// This function reads from the stdin with a 'prompt_buffer', stringify the result, packs it into
 /// many different messages with the given username and sends them through the tcp_writer.
@@ -319,7 +317,13 @@ pub async fn message_paketer(
 
     'accepting_new_prompt: loop {
         print!("{username}:> ");
-        std::io::stdout().flush()?;
+        match std::io::stdout().flush() {
+            Ok(()) => (),
+            Err(err) => {
+                eprint_small_error(err);
+                continue 'accepting_new_prompt;
+            }
+        }
 
         previous_prompt_fragment.clear();
 
@@ -347,6 +351,16 @@ pub async fn message_paketer(
                         .map(|&byte| byte)
                         .collect();
 
+                    let content_if_failed_conversion = "[[This text chunk has not been properly processed from the prompt of the client. The server apologises for the inconvenience.]]".to_string();
+                    let paket_if_failed_conversion =
+                        match Message::new(username, &content_if_failed_conversion) {
+                            Ok(msg) => msg.paket(),
+                            Err(err) => {
+                                eprint_small_error(err);
+                                continue;
+                            }
+                        };
+
                     let text = match String::from_utf8(chunk_to_process.clone()) {
                         Ok(text) => {
                             previous_prompt_fragment.clear();
@@ -355,16 +369,27 @@ pub async fn message_paketer(
                         Err(error) => match error.utf8_error().error_len() {
                             None => {
                                 let last_valid_index = error.utf8_error().valid_up_to();
-                                let text_result = String::from_utf8(
+                                let text_conversion = String::from_utf8(
                                     chunk_to_process[..last_valid_index].to_vec().clone(),
                                 );
 
                                 previous_prompt_fragment =
                                     chunk_to_process[last_valid_index..].to_vec();
 
-                                text_result?
+                                match text_conversion {
+                                    Ok(text) => text,
+                                    Err(err) => {
+                                        eprint_small_error(err);
+                                        tcp_writer.write_all(&paket_if_failed_conversion).await?;
+                                        continue 'accepting_new_prompt;
+                                    }
+                                }
                             }
-                            Some(_len) => return Err(MsgPaketerError::from(error)),
+                            Some(_len) => {
+                                eprint_small_error(error);
+                                tcp_writer.write_all(&paket_if_failed_conversion).await?;
+                                continue 'accepting_new_prompt;
+                            }
                         },
                     };
 
@@ -378,8 +403,14 @@ pub async fn message_paketer(
 
                     let mut msg_result_stream = tokio_stream::iter(msg_results);
 
-                    while let Some(msg_result) = msg_result_stream.next().await {
-                        let paket = msg_result?.paket()?;
+                    'sending_messages: while let Some(msg_result) = msg_result_stream.next().await {
+                        let paket = match msg_result {
+                            Ok(msg) => msg.paket(),
+                            Err(err) => {
+                                eprint_small_error(err);
+                                continue 'sending_messages;
+                            }
+                        };
                         tcp_writer.write_all(&paket).await?;
                     }
 
@@ -393,7 +424,7 @@ pub async fn message_paketer(
                 // ambigous outcome: the tokio documentation claims this means an EOF and thus
                 // that the reader could still return something, while the empirics tells me that
                 // this happens only when the reader is unlinked from its source. I should verify.
-                Ok(_null) => continue 'accepting_new_prompt,
+                Ok(_null) => continue 'processing_prompt_buffer,
                 Err(error) => return Err(MsgPaketerError::from(error)),
             }
         }
@@ -409,13 +440,16 @@ pub async fn message_paketer(
 pub enum MsgPaketerError {
     Io(#[from] std::io::Error),
     TxReceive(#[from] tokio::sync::mpsc::error::TryRecvError),
-    #[error("Unsual None returned from '{entity}' in 'handle_msgs_reader'.")]
-    UnusualEmptyEntity {
-        entity: String,
-    },
-    StringFromUtf8(#[from] std::string::FromUtf8Error),
-    TextValidity(#[from] TextValidityError),
-    SerdeJsonError(#[from] serde_json::Error),
+}
+
+#[derive(Error, Debug)]
+#[error("Unusual None returned from '{entity}' in 'message_paketer'.")]
+pub struct UnusualEmptyEntity {
+    entity: String,
+}
+
+pub fn eprint_small_error(err: impl std::error::Error) {
+    eprintln!("##SmallError. Error: {}", err.to_string());
 }
 
 // ############################## TEST UTILITIES ##############################
@@ -520,7 +554,7 @@ pub mod test {
 
         let valid_msg =
             Message::new(&valid_name, &valid_content).expect("The message is not valid");
-        let valid_paket = valid_msg.clone().paket().expect("The paket is not valid");
+        let valid_paket = valid_msg.clone().paket();
 
         assert_eq!(Message::from_paket(valid_paket), Ok(valid_msg));
 
@@ -574,9 +608,7 @@ pub mod test {
             .map(|num| {
                 let username = format!("user{}", num);
                 let random_message = test_util::craft_random_msg(&username);
-                random_message
-                    .paket()
-                    .expect("The paketing of a random message failed.")
+                random_message.paket()
             })
             .flatten()
             .collect();
