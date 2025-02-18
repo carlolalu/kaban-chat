@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
+use std::fmt;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync,
 };
 
 use std::io::Write;
+use std::string::ToString;
 
 use tokio_stream::StreamExt;
 
@@ -21,11 +23,62 @@ pub mod constant {
 
 // ############################## STRUCTS ##############################
 
+/// This struct has only one purpose: ensure that the username is not longer than a certain length.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Username(String);
+
+impl Username {
+    /// Maximal length (in chars) of the username.
+    pub const MAX_LEN: usize = 32;
+
+    fn new(username_candidate: &str) -> Result<Username, TextValidityError> {
+        if username_candidate.chars().count() > Username::MAX_LEN {
+            return Err(TextValidityError::TooLong {
+                kind_of_entity: "username".to_string(),
+                actual_entity: username_candidate.to_string(),
+                max_len: Username::MAX_LEN,
+                actual_len: username_candidate.chars().count(),
+            });
+        }
+        Ok(Username(username_candidate.to_string()))
+    }
+
+    pub fn choose() -> Username {
+        let username = loop {
+            print!(r###"Please input your desired userid and press "Enter": "###);
+            if std::io::stdout().flush().is_err() {
+                continue;
+            }
+
+            let mut username = String::new();
+
+            if std::io::stdin().read_line(&mut username).is_err() {
+                continue;
+            }
+
+            let username = username.trim().to_string();
+
+            match Username::new(&username) {
+                Ok(username) => break username,
+                Err(err) => eprint_small_error(err),
+            }
+        };
+
+        username
+    }
+}
+
+impl fmt::Display for Username {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Message is the type of packet unit that the client uses. They comprehend a username of at most
 /// MAX_USERNAME_LEN chars and a content of at most MAX_CONTENT_LEN chars.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Message {
-    username: String,
+    username: Username,
     content: String,
 }
 
@@ -35,43 +88,18 @@ impl Message {
     pub(crate) const PAKET_INIT_U8: u8 = 0xC0;
     pub(crate) const PAKET_END_U8: u8 = 0xC1;
 
-    /// Maximal length (in chars) of the username.
-    pub const MAX_USERNAME_LEN: usize = 32;
-
-    /// Maximal length (in chars) of the content of the message.
-    pub const MAX_CONTENT_LEN: usize = 256;
-
-    /// Maximal length of a paketed message (=JSON serialised message **in bytes** sorrounded by the <init/end> paket bytes)
-    ///
-    /// The reasoning is that if the serialised message contains a special character (e.g. '{') at every
-    /// (utf8-)char of the username and at every (utf8-)char of the content, and if such char
-    /// is exactly 1 byte long, then the message will double its username and content u8_len, because the
-    /// special char, in the serialization process, will be preceded by a '\' symbol (e.g. '\{').
-    pub const MAX_PAKETED_MSG_U8_LEN: usize = {
-        let delimiters_u8_len = 2_usize;
-
-        // Rough estimate of "{\n""\n}, etc...
-        let json_encapsulation_u8_len = 20_usize;
-
-        let max_char_u8_len = 4_usize;
-        let special_char_serialised_u8_len = max_char_u8_len * 2;
-
-        let max_serialised_msg_u8_len = json_encapsulation_u8_len
-            + (Message::MAX_USERNAME_LEN + Message::MAX_CONTENT_LEN)
-                * special_char_serialised_u8_len;
-        max_serialised_msg_u8_len + delimiters_u8_len
+    /// Maximal length (in chars) of the content of the message. Keep in mind that a char is at most
+    /// 4 byte long, and that a vector in Rust is at most (isize::MAX / 2) long. Since String is in
+    /// reality a Vec of bytes, choices were made. The factor 100 is a security measure.
+    pub const MAX_CONTENT_LEN: usize = {
+        let max_char_len_string = (((isize::MAX / 2) / 4) / 100) as usize;
+        max_char_len_string / 2
     };
 
-    pub fn new(username: &str, content: &str) -> Result<Message, TextValidityError> {
-        if username.chars().count() > Message::MAX_USERNAME_LEN {
-            return Err(TextValidityError::TooLong {
-                kind_of_entity: "username".to_string(),
-                actual_entity: username.to_string(),
-                max_len: Message::MAX_USERNAME_LEN,
-                actual_len: username.chars().count(),
-            });
-        }
+    pub(crate) const INCOMING_MSG_BUFFER_U8_LEN: usize = 1000_usize;
+    pub(crate) const OUTGOING_MSG_BUFFER_U8_LEN: usize = 1000_usize;
 
+    pub(crate) fn new(username: &Username, content: &str) -> Result<Message, TextValidityError> {
         if content.chars().count() > Message::MAX_CONTENT_LEN {
             return Err(TextValidityError::TooLong {
                 kind_of_entity: "content".to_string(),
@@ -82,23 +110,24 @@ impl Message {
         }
 
         Ok(Message {
-            username: username.to_string(),
+            username: username.clone(),
             content: content.to_string(),
         })
     }
 
-    pub fn many_try_new(username: &str, text: &str) -> Vec<Result<Message, TextValidityError>> {
-        let msgs: Vec<_> = text
+    pub(crate) fn new_many(username: &Username, text: &str) -> Vec<Message> {
+        let messages: Vec<Message> = text
             .chars()
-            .collect::<Vec<_>>()
+            .collect::<Vec<char>>()
             .chunks(Message::MAX_CONTENT_LEN)
-            .map(|chars_content| chars_content.iter().collect::<String>())
-            .map(|content| Message::new(username, &content))
+            // Justification 'unwrap': this can panic only if the content.len()>Message::MAX_CONTENT_LEN,
+            // but this cannot happen because of the previous iterator adapter.
+            .map(|content| Message::new(username, &content.iter().collect::<String>()).unwrap())
             .collect();
-        msgs
+        messages
     }
 
-    pub fn get_username(&self) -> String {
+    pub fn get_username(&self) -> Username {
         self.username.clone()
     }
 
@@ -108,7 +137,11 @@ impl Message {
 
     pub fn paket(self) -> Vec<u8> {
         let serialized_in_bytes: Vec<u8> = serde_json::to_string(&self)
-            .expect("The conversion of Message to its serialised JSON version failed.")
+            // Justification 'unwrap': 'serde_json::to_string' fails if:
+            // > "Serialization can fail if `T`'s implementation of `Serialize` decides to
+            // > fail, or if `T` contains a map with non-string keys.".
+            // Message contains only String(s) or wrapped String(s), thus this cannot fail.
+            .unwrap()
             .as_bytes()
             .into_iter()
             .map(|&byte| byte)
@@ -121,7 +154,7 @@ impl Message {
         paket
     }
 
-    fn from_paket(candidate: Vec<u8>) -> Result<Message, MsgFromPaketError> {
+    pub fn from_paket(candidate: Vec<u8>) -> Result<Message, MsgFromPaketError> {
         match candidate.first() {
             Some(&byte) if byte == Message::PAKET_INIT_U8 => (),
             Some(&_byte) => return Err(MsgFromPaketError::NoInitDelimiter { candidate }),
@@ -152,6 +185,35 @@ impl Message {
             }
         };
         Ok(message)
+    }
+}
+
+pub enum UserStatus {
+    Present,
+    Absent,
+}
+
+
+// Justification 'unwrap': We expect that Message::MAX_CONTENT_LEN and Username::MAX_LEN should be
+// big enough to write in a message official communications of this kind, and the only reason
+// Message::new may fail is due to the length of its content.
+/// This collection gathers the functions which create 'official' messages.
+impl Message {
+    pub fn craft_msg_helo(username: &Username) -> Message {
+        Message::new(username, "helo").unwrap()
+    }
+
+    pub fn craft_msg_change_status(username: &Username, new_status: UserStatus) -> Message {
+        let content = match new_status {
+            UserStatus::Present => format!("{username} just joined the chat"),
+            UserStatus::Absent => format!("{username} just left the chat"),
+        };
+        Message::new(&Username("SERVER".to_string()), &content).unwrap()
+    }
+
+    pub fn craft_msg_server_interrupt_connection() -> Message {
+        let content = "The SERVER is shutting down this connection.".to_string();
+        Message::new(&Username("SERVER".to_string()), &content).unwrap()
     }
 }
 
