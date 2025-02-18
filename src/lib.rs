@@ -96,6 +96,10 @@ impl Message {
         max_char_len_string / 2
     };
 
+    /// The magic number 40 is here a rough estimate for the byte needed for the serde JSON
+    /// encapsulation ('\n', '"', '{' '}' etc...)
+    pub const MAX_PAKET_U8_LEN: usize = Message::MAX_CONTENT_LEN * 4 + Username::MAX_LEN * 4 + 40;
+
     pub(crate) const INCOMING_MSG_BUFFER_U8_LEN: usize = 1000_usize;
     pub(crate) const OUTGOING_MSG_BUFFER_U8_LEN: usize = 1000_usize;
 
@@ -283,16 +287,14 @@ impl Dispatch {
 
 // ############################## ASYNC READ AND WRITE FUNCTIONS ##############################
 
-/// This function reads messages from a Reader and forward them through its channel.
-pub async fn message_depaketer(
+/// This function reads pakets from a Reader and forward them through its channel.
+pub async fn pakets_extractor(
     mut tcp_reader: impl AsyncRead + Unpin + Send + 'static,
-    tx: sync::mpsc::Sender<Result<Message, MsgFromPaketError>>,
+    tx: sync::mpsc::Sender<Vec<u8>>,
     // cancellation token
 ) -> Result<(), MsgDepaketerError> {
-    let msgs_per_buffer = 10_usize;
-
-    let mut buffer: Vec<u8> = Vec::with_capacity(Message::MAX_PAKETED_MSG_U8_LEN * msgs_per_buffer);
-    let mut previous_fragment: Vec<u8> = Vec::with_capacity(Message::MAX_PAKETED_MSG_U8_LEN);
+    let mut buffer: Vec<u8> = Vec::with_capacity(Message::INCOMING_MSG_BUFFER_U8_LEN);
+    let mut previous_fragment: Vec<u8> = Vec::with_capacity(Message::INCOMING_MSG_BUFFER_U8_LEN);
 
     'write_on_buffer: loop {
         buffer.clear();
@@ -305,7 +307,7 @@ pub async fn message_depaketer(
                     .split_inclusive(|&byte| byte == Message::PAKET_END_U8)
                     .collect();
 
-                let (first_fragment, not_first_fragments) = match actual_fragments.split_first() {
+                let (first_fragment, subsequent_fragments) = match actual_fragments.split_first() {
                     Some(smt) => (*smt.0, smt.1),
                     None => {
                         let err = UnusualEmptyEntity {
@@ -316,39 +318,50 @@ pub async fn message_depaketer(
                     }
                 };
 
-                let first_paket_candidate = previous_fragment
-                    .iter()
-                    .chain(first_fragment.iter())
-                    .map(|&byte| byte)
-                    .collect();
-                let first_msg_result = Message::from_paket(first_paket_candidate);
-                tx.send(first_msg_result).await?;
+                if Some(&Message::PAKET_END_U8) == first_fragment.last() {
+                    let first_paket_candidate = previous_fragment
+                        .iter()
+                        .chain(first_fragment.iter())
+                        .map(|&byte| byte)
+                        .collect();
 
-                let (last_fragment, middle_fragments) = match not_first_fragments.split_last() {
-                    Some(smt) => (*smt.0, smt.1),
-                    None => continue 'write_on_buffer,
-                };
+                    tx.send(first_paket_candidate).await?;
 
-                let mut stream = tokio_stream::iter(middle_fragments);
-                while let Some(&fragment) = stream.next().await {
-                    let msg_result = Message::from_paket(fragment.to_vec());
-                    tx.send(msg_result).await?;
-                }
+                    let (last_fragment, middle_fragments) = match subsequent_fragments.split_last()
+                    {
+                        Some(smt) => (*smt.0, smt.1),
+                        None => continue 'write_on_buffer,
+                    };
 
-                // The loop assumptions are fulfilled here
-                match last_fragment.last() {
-                    Some(&ch) if ch == Message::PAKET_END_U8 => {
-                        let last_msg_result = Message::from_paket(last_fragment.to_vec());
-                        tx.send(last_msg_result).await?;
-                        previous_fragment.clear()
+                    let mut stream = tokio_stream::iter(middle_fragments);
+                    while let Some(&fragment) = stream.next().await {
+                        tx.send(fragment.to_vec()).await?;
                     }
-                    Some(&_ch) => *previous_fragment = last_fragment.to_vec(),
-                    None => {
-                        let err = UnusualEmptyEntity {
-                            entity: "last_fragment".to_string(),
+
+                    // The loop assumptions are fulfilled here
+                    match last_fragment.last() {
+                        Some(&ch) if ch == Message::PAKET_END_U8 => {
+                            tx.send(last_fragment.to_vec()).await?;
+                            previous_fragment.clear()
+                        }
+                        Some(&_ch) => *previous_fragment = last_fragment.to_vec(),
+                        None => {
+                            let err = UnusualEmptyEntity {
+                                entity: "last_fragment".to_string(),
+                            };
+                            eprint_small_error(err);
+                            continue 'write_on_buffer;
+                        }
+                    }
+                } else {
+                    previous_fragment.append(&mut first_fragment.to_vec());
+
+                    if previous_fragment.len() > Message::MAX_PAKET_U8_LEN {
+                        let err = MsgDepaketerError::TooLongPaket {
+                            paket_u8_len: previous_fragment.len(),
                         };
                         eprint_small_error(err);
-                        continue 'write_on_buffer;
+                        previous_fragment.clear()
                     }
                 }
             }
@@ -363,7 +376,11 @@ pub async fn message_depaketer(
 #[error(transparent)]
 pub enum MsgDepaketerError {
     Io(#[from] std::io::Error),
-    TxSend(#[from] tokio::sync::mpsc::error::SendError<Result<Message, MsgFromPaketError>>),
+    TxSend(#[from] tokio::sync::mpsc::error::SendError<Vec<u8>>),
+    #[error("A too long paket arrived, it had {paket_u8_len} bytes. Such paket will be dropped.")]
+    TooLongPaket {
+        paket_u8_len: usize,
+    },
 }
 
 /// This function reads from the stdin with a 'prompt_buffer', stringify the result, packs it into
