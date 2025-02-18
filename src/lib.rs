@@ -385,14 +385,16 @@ pub enum MsgDepaketerError {
 
 /// This function reads from the stdin with a 'prompt_buffer', stringify the result, packs it into
 /// many different messages with the given username and sends them through the tcp_writer.
-pub async fn message_paketer(
+pub async fn stdin2tcp(
     mut stdin: impl AsyncRead + Unpin,
     mut tcp_writer: impl AsyncWrite + Unpin,
-    username: &str,
+    username: &Username,
     // cancellation_token: CancellationToken
 ) -> Result<(), MsgPaketerError> {
-    let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::MAX_CONTENT_LEN);
-    let mut previous_prompt_fragment: Vec<u8> = Vec::with_capacity(3);
+    let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::OUTGOING_MSG_BUFFER_U8_LEN);
+    let mut prompt: Vec<u8> = Vec::with_capacity(Message::OUTGOING_MSG_BUFFER_U8_LEN * 30);
+
+    let prompt = &mut prompt;
 
     'accepting_new_prompt: loop {
         print!("{username}:> ");
@@ -404,11 +406,10 @@ pub async fn message_paketer(
             }
         }
 
-        previous_prompt_fragment.clear();
+        prompt.clear();
 
-        'processing_prompt_buffer: loop {
-            // Loop assumption: previous_prompt_fragment is initialised (eventually empty)
-
+        // Build a Vec<String> where each String has at most Message::MAX_CONTENT_LEN chars
+        'stringigy_prompt_buffer: loop {
             prompt_buffer.clear();
 
             match stdin.read_buf(&mut prompt_buffer).await {
@@ -420,96 +421,42 @@ pub async fn message_paketer(
                         false
                     };
 
-                    if prompt_buffer.is_empty() {
-                        continue 'accepting_new_prompt;
-                    }
-
-                    let chunk_to_process: Vec<u8> = previous_prompt_fragment
+                    *prompt = prompt
                         .iter()
                         .chain(prompt_buffer.iter())
                         .map(|&byte| byte)
                         .collect();
 
-                    let content_if_failed_conversion = "[[This text chunk has not been properly processed from the prompt of the client. The server apologises for the inconvenience.]]".to_string();
-                    let paket_if_failed_conversion =
-                        match Message::new(username, &content_if_failed_conversion) {
-                            Ok(msg) => msg.paket(),
-                            Err(err) => {
-                                eprint_small_error(err);
-                                continue;
-                            }
-                        };
-
-                    let text = match String::from_utf8(chunk_to_process.clone()) {
-                        Ok(text) => {
-                            previous_prompt_fragment.clear();
-                            text
-                        }
-                        Err(error) => match error.utf8_error().error_len() {
-                            None => {
-                                let last_valid_index = error.utf8_error().valid_up_to();
-                                let text_conversion = String::from_utf8(
-                                    chunk_to_process[..last_valid_index].to_vec().clone(),
-                                );
-
-                                previous_prompt_fragment =
-                                    chunk_to_process[last_valid_index..].to_vec();
-
-                                match text_conversion {
-                                    Ok(text) => text,
-                                    Err(err) => {
-                                        eprint_small_error(err);
-                                        tcp_writer.write_all(&paket_if_failed_conversion).await?;
-                                        continue 'accepting_new_prompt;
-                                    }
-                                }
-                            }
-                            Some(_len) => {
-                                eprint_small_error(error);
-                                tcp_writer.write_all(&paket_if_failed_conversion).await?;
-                                continue 'accepting_new_prompt;
-                            }
-                        },
-                    };
-
-                    let msg_results: Vec<Result<Message, TextValidityError>> = text
-                        .chars()
-                        .collect::<Vec<char>>()
-                        .chunks(Message::MAX_CONTENT_LEN)
-                        .map(|char_slice| String::from_iter(char_slice))
-                        .map(|content| Message::new(username, &content))
-                        .collect();
-
-                    let mut msg_result_stream = tokio_stream::iter(msg_results);
-
-                    'sending_messages: while let Some(msg_result) = msg_result_stream.next().await {
-                        let paket = match msg_result {
-                            Ok(msg) => msg.paket(),
-                            Err(err) => {
-                                eprint_small_error(err);
-                                continue 'sending_messages;
-                            }
-                        };
-                        tcp_writer.write_all(&paket).await?;
-                    }
-
-                    if is_last_chunk {
-                        continue 'accepting_new_prompt;
-                    } else {
-                        continue 'processing_prompt_buffer;
+                    if is_last_chunk || prompt_buffer.is_empty() {
+                        break 'stringigy_prompt_buffer;
                     }
                 }
                 // todo: handle the transmission of 0 bytes with graceful shutdown. It is an
                 // ambigous outcome: the tokio documentation claims this means an EOF and thus
                 // that the reader could still return something, while the empirics tells me that
                 // this happens only when the reader is unlinked from its source. I should verify.
-                Ok(_null) => continue 'processing_prompt_buffer,
+                Ok(_null) => continue 'stringigy_prompt_buffer,
                 Err(error) => return Err(MsgPaketerError::from(error)),
             }
         }
+
+        let text = match String::from_utf8(prompt.to_vec()) {
+            Ok(text) => text,
+            Err(err) => {
+                eprint_small_error(err);
+                continue 'accepting_new_prompt;
+            }
+        };
+
+        let pakets: Vec<u8> = Message::new_many(username, &text)
+            .into_iter()
+            .map(|msg| msg.paket())
+            .flatten()
+            .collect();
+        tcp_writer.write_all(&pakets).await?;
     }
 
-    // todo: remove this when adding graceful shutdown
+    // remove this when adding graceful shutdown
     #[allow(unreachable_code)]
     Ok(())
 }
