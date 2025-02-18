@@ -92,7 +92,7 @@ impl Message {
     /// 4 byte long, and that a vector in Rust is at most (isize::MAX / 2) long. Since String is in
     /// reality a Vec of bytes, choices were made. The factor 100 is a security measure.
     pub const MAX_CONTENT_LEN: usize = {
-        let max_char_len_string = (((isize::MAX / 2) / 4) / 100) as usize;
+        let max_char_len_string = 10000_usize;
         max_char_len_string / 2
     };
 
@@ -483,7 +483,7 @@ pub fn eprint_small_error(err: impl std::error::Error) {
 pub mod test_util {
     use crate::*;
 
-    pub fn craft_random_valid_text_of_len(char_length: usize) -> String {
+    pub fn craft_random_text_of_len(char_length: usize) -> String {
         use rand::distr::{SampleString, StandardUniform};
 
         let random_string: String = StandardUniform.sample_string(&mut rand::rng(), char_length);
@@ -492,9 +492,9 @@ pub mod test_util {
         random_string
     }
 
-    pub fn craft_random_valid_text() -> String {
-        let random_len = rand::random_range(0..Message::MAX_CONTENT_LEN);
-        let random_valid_text = craft_random_valid_text_of_len(random_len);
+    pub fn craft_random_text() -> String {
+        let random_len = rand::random_range(0..(isize::MAX as usize));
+        let random_valid_text = craft_random_text_of_len(random_len);
 
         //println!("random_valid_text: [[[{random_valid_text}]]]");
 
@@ -502,7 +502,8 @@ pub mod test_util {
     }
 
     pub fn craft_random_msg(username: &Username) -> Message {
-        let valid_text = craft_random_valid_text();
+        let random_msg_len = rand::random_range(0..Message::MAX_CONTENT_LEN);
+        let valid_text = craft_random_text_of_len(random_msg_len);
         Message::new(username, &valid_text).expect("The random message construction failed.")
     }
 }
@@ -511,104 +512,75 @@ pub mod test_util {
 
 #[cfg(test)]
 pub mod test {
-    use crate::test_util::craft_random_valid_text;
+    use crate::test_util::*;
     use crate::*;
     use tokio::net::TcpStream;
     use tokio_util::task::TaskTracker;
 
     #[test]
     fn test_text_validity() {
-        let valid_name = (1..=Message::MAX_USERNAME_LEN)
-            .map(|_num| 'a')
-            .collect::<String>();
-        let valid_content = (1..=Message::MAX_CONTENT_LEN)
-            .map(|_num| 'a')
-            .collect::<String>();
+        let valid_username = craft_random_text_of_len(Username::MAX_LEN);
+        let valid_content = craft_random_text_of_len(Message::MAX_CONTENT_LEN);
 
-        let too_long_name = (1..=Message::MAX_USERNAME_LEN + 1)
-            .map(|_num| 'a')
-            .collect::<String>();
-        let too_long_content = (1..=Message::MAX_CONTENT_LEN + 1)
-            .map(|_num| 'a')
-            .collect::<String>();
+        let username =
+            Username::new(&valid_username).expect("This username should have been valid");
+        let valid_msg = Message::new(&username, &valid_content);
+        assert!(valid_msg.is_ok());
 
-        assert_eq!(
-            Message::new(&valid_name, &valid_content),
-            Ok(Message {
-                username: valid_name.clone(),
-                content: valid_content.clone()
-            })
-        );
-        assert_eq!(
-            Message::new(&valid_name, &too_long_content),
-            Err(TextValidityError::TooLong {
-                kind_of_entity: "content".to_string(),
-                actual_entity: too_long_content.to_string(),
-                max_len: Message::MAX_CONTENT_LEN,
-                actual_len: too_long_content.chars().count()
-            })
-        );
-        assert_eq!(
-            Message::new(&too_long_name, &valid_content),
-            Err(TextValidityError::TooLong {
-                kind_of_entity: "username".to_string(),
-                actual_entity: too_long_name.to_string(),
-                max_len: Message::MAX_USERNAME_LEN,
-                actual_len: too_long_name.chars().count()
-            })
-        );
+        let too_long_username = craft_random_text_of_len(Message::MAX_CONTENT_LEN + 1);
+        let too_long_content = craft_random_text_of_len(Message::MAX_CONTENT_LEN + 1);
+
+        let invalid_username = Username::new(&too_long_username);
+        assert!(invalid_username.is_err());
+
+        let invalid_message = Message::new(&username, &too_long_content);
+        assert!(invalid_message.is_err());
     }
 
     #[test]
-    fn test_craft_random_valid_text() {
+    fn test_craft_random_valid_text_of_len() {
         for _ in 0..100 {
-            let random_valid_text = test_util::craft_random_valid_text(80);
+            let random_valid_text = test_util::craft_random_text_of_len(80);
             assert_eq!(random_valid_text.chars().count(), 80);
             // println!("Your random valid text is: [[[{random_valid_text}]]]");
         }
     }
 
     #[test]
-    fn test_craft_random_msg() {
-        for _ in 0..100 {
-            let random_username = test_util::craft_random_valid_text(Message::MAX_USERNAME_LEN);
-            let _random_msg_result = test_util::craft_random_msg(&random_username);
-
-            // println!("msg_result: [[[{:?}]]]", _random_msg_result);
-        }
-    }
-
-    #[test]
     fn test_msg2paket2msg() {
-        let valid_name = (1..=Message::MAX_USERNAME_LEN)
-            .map(|_num| 'a')
-            .collect::<String>();
-        let valid_content = (1..=Message::MAX_CONTENT_LEN)
-            .map(|_num| 'a')
-            .collect::<String>();
+        let valid_name = craft_random_text_of_len(Username::MAX_LEN);
+        let valid_content = craft_random_text_of_len(Message::MAX_CONTENT_LEN);
 
-        let valid_msg =
-            Message::new(&valid_name, &valid_content).expect("The message is not valid");
+        let valid_msg = Message::new(&Username::new(&valid_name).unwrap(), &valid_content)
+            .expect("This message should have been valid!");
         let valid_paket = valid_msg.clone().paket();
 
-        assert_eq!(Message::from_paket(valid_paket), Ok(valid_msg));
+        assert_eq!(Message::from_paket(valid_paket), Ok(valid_msg.clone()));
 
-        let random_invalid_string_as_bytes: Vec<u8> =
-            "aaaa".as_bytes().into_iter().map(|&byte| byte).collect();
+        let random_short_text = craft_random_text_of_len(Message::MAX_CONTENT_LEN);
 
-        let candidate_no_init_delimiter: Vec<_> = random_invalid_string_as_bytes
-            .clone()
+        let candidate_no_init_delimiter: Vec<_> = serde_json::to_string(&valid_msg)
+            .expect("The serde JSON serialization failed")
+            .as_bytes()
             .into_iter()
-            .chain([Message::PAKET_END_U8])
+            .chain(&[Message::PAKET_END_U8])
+            .map(|&byte| byte)
             .collect();
-        let candidate_no_end_delimiter: Vec<_> = [Message::PAKET_INIT_U8]
+        let candidate_no_end_delimiter: Vec<_> = [&Message::PAKET_INIT_U8]
             .into_iter()
-            .chain(random_invalid_string_as_bytes.clone().into_iter())
+            .chain(
+                serde_json::to_string(&valid_msg)
+                    .expect("The serde JSON serialization failed")
+                    .as_bytes()
+                    .iter(),
+            )
+            .map(|&byte| byte)
             .collect();
-        let candidate_not_valid_serialised_msg: Vec<u8> = [Message::PAKET_INIT_U8]
+        let candidate_not_valid_serialised_msg: Vec<_> = [&Message::PAKET_INIT_U8]
             .into_iter()
-            .chain(random_invalid_string_as_bytes)
-            .chain([Message::PAKET_END_U8].into_iter())
+            .chain(random_short_text.as_bytes())
+            .chain([&Message::PAKET_END_U8].into_iter())
+            .map(|&byte| byte)
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -626,7 +598,7 @@ pub mod test {
         assert_eq!(
             Message::from_paket(candidate_not_valid_serialised_msg),
             Err(MsgFromPaketError::SerdeJson {
-                dispaketed_candidate: "aaaa".to_string(),
+                dispaketed_candidate: random_short_text,
                 category: serde_json::error::Category::Syntax,
                 io_error_kind: None,
                 line: 1,
@@ -636,12 +608,13 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn test_message_depaketer() {
+    async fn test_pakets_extractor() {
         let num_messages = 100;
 
         let paket: Vec<u8> = (0..num_messages)
             .map(|num| {
-                let username = format!("user{}", num);
+                let username =
+                    Username::new(&format!("user{}", num)).expect("This username is not valid");
                 let random_message = test_util::craft_random_msg(&username);
                 random_message.paket()
             })
@@ -653,32 +626,36 @@ pub mod test {
         let (tx, mut rx) = tokio::sync::mpsc::channel(20);
 
         let task_tracker = TaskTracker::new();
+        let mut handles = Vec::new();
 
-        task_tracker.spawn(async move {
-            message_depaketer(reader, tx)
+        handles.push(task_tracker.spawn(async move {
+            pakets_extractor(reader, tx)
                 .await
                 .expect("The message depaketer failed.");
-            Ok::<(), MsgDepaketerError>(())
-        });
+        }));
 
-        task_tracker.spawn(async move {
-            while let Some(result) = rx.recv().await {
-                // println!("result: {:?}", result);
-                assert!(result.is_ok());
-
-                if let Ok(_msg) = result {
+        handles.push(task_tracker.spawn(async move {
+            while let Some(paket) = rx.recv().await {
+                let message_result = Message::from_paket(paket);
+                assert!(message_result.is_ok());
+                if let Ok(_msg) = message_result {
                     // println!("{}:> {}", _msg.get_username(), _msg.get_content());
                 }
             }
-            Ok::<(), TextValidityError>(())
-        });
+        }));
 
         task_tracker.close();
         task_tracker.wait().await;
+
+        for handle in handles {
+            if handle.await.is_err() {
+                panic!("One of the tasks panicked!")
+            }
+        }
     }
 
     #[tokio::test]
-    async fn test_message_paketer() {
+    async fn test_stdin2tcp() {
         let num_messages_prompt = 100;
 
         let prompt_buffer0 = "Nam ignoratione rerum bonarum et malarum maxime
@@ -691,14 +668,11 @@ temeritate derepta se nobis certissimam ducem praebeat ad
 voluptatem\n"
             .to_string();
 
-        let prompt_buffer1 = format!(
-            "{}\n",
-            craft_random_valid_text(Message::MAX_CONTENT_LEN * num_messages_prompt)
-        );
+        let prompt_buffer1 = format!("{}\n", craft_random_text_of_len(Message::MAX_CONTENT_LEN));
 
         let prompt_buffer2 = (1..=num_messages_prompt).map(|num| -> Vec<char> {
             let prefix_len = "MESSAGE_n__[[[]]]\n".chars().count() + 1_usize + (num as f64).log10().floor() as usize;
-            let msg = format!{"MESSAGE_n_{}_[[[{}]]]\n", num, craft_random_valid_text(Message::MAX_CONTENT_LEN - prefix_len)};
+            let msg = format!{"MESSAGE_n_{}_[[[{}]]]\n", num, craft_random_text_of_len(Message::MAX_CONTENT_LEN - prefix_len)};
             msg.chars().collect()
         }).flatten().collect::<String>();
 
@@ -710,8 +684,7 @@ voluptatem\n"
 
         let stdin = tokio::io::BufReader::new(stdin);
 
-        let (tx_depaketer, mut rx_depaketer) =
-            tokio::sync::mpsc::channel::<Result<Message, MsgFromPaketError>>(20);
+        let (tx_depaketer, mut rx_depaketer) = tokio::sync::mpsc::channel::<Vec<u8>>(20);
 
         let test_task_tracker = TaskTracker::new();
 
@@ -723,7 +696,7 @@ voluptatem\n"
 
             let (socket_stream_server, _addr) = listener.accept().await.expect("point1");
 
-            message_depaketer(socket_stream_server, tx_depaketer)
+            pakets_extractor(socket_stream_server, tx_depaketer)
                 .await
                 .unwrap();
         });
@@ -734,25 +707,35 @@ voluptatem\n"
                 .await
                 .expect("point2");
 
-            message_paketer(stdin, socket_stream_client, "peppino")
-                .await
-                .expect("I just exited the message paketer with an error");
+            stdin2tcp(
+                stdin,
+                socket_stream_client,
+                &Username::new("peppino").unwrap(),
+            )
+            .await
+            .expect("I just exited the message paketer with an error");
         });
 
-        while let Ok(msg) = rx_depaketer
-            .recv()
-            .await
-            .expect("something went wrong in the message transmission")
-        {
-            println!("{}:> {}", msg.get_username(), msg.get_content());
-        }
+        let messages = test_task_tracker.spawn(async move {
+            loop {
+                let paket = rx_depaketer
+                    .recv()
+                    .await
+                    .expect("something went wrong in the message transmission");
 
+                let msg_result = Message::from_paket(paket);
+                assert!(msg_result.is_ok());
+                if let Ok(_msg) = msg_result {
+                    // println!("{}:> {}", _msg.get_username(), _msg.get_content());
+                }
+            }
+        });
         // todo: add graceful shutdown in the test as well: a clean "Ok" for the test is auspicable.
 
         test_task_tracker.close();
         test_task_tracker.wait().await;
 
-        if server.await.is_err() || client.await.is_err() {
+        if server.await.is_err() || client.await.is_err() || messages.await.is_err() {
             panic!("One of the two handles panicked");
         }
     }
