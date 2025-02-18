@@ -483,7 +483,7 @@ pub fn eprint_small_error(err: impl std::error::Error) {
 pub mod test_util {
     use crate::*;
 
-    pub fn craft_random_valid_text(char_length: usize) -> String {
+    pub fn craft_random_valid_text_of_len(char_length: usize) -> String {
         use rand::distr::{SampleString, StandardUniform};
 
         let random_string: String = StandardUniform.sample_string(&mut rand::rng(), char_length);
@@ -492,8 +492,17 @@ pub mod test_util {
         random_string
     }
 
-    pub fn craft_random_msg(username: &str) -> Message {
-        let valid_text = craft_random_valid_text(Message::MAX_CONTENT_LEN);
+    pub fn craft_random_valid_text() -> String {
+        let random_len = rand::random_range(0..Message::MAX_CONTENT_LEN);
+        let random_valid_text = craft_random_valid_text_of_len(random_len);
+
+        //println!("random_valid_text: [[[{random_valid_text}]]]");
+
+        random_valid_text
+    }
+
+    pub fn craft_random_msg(username: &Username) -> Message {
+        let valid_text = craft_random_valid_text();
         Message::new(username, &valid_text).expect("The random message construction failed.")
     }
 }
