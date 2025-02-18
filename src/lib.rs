@@ -262,26 +262,30 @@ pub enum MsgFromPaketError {
     EmptyPaket,
 }
 
-/// Dispatch is the type of packet unit used exclusively by the server. It associates a message
+/// Dispatch is the type of packet unit used exclusively by the server. It associates a byte vector
 /// with an identifier, so that the clients can avoid to receive their own messages in cases of
-/// multiple equal nicknames.
+/// multiple equal nicknames. The bytes are not assured to be a valid paket, even though this is auspicable.
 #[derive(Debug, Clone)]
 pub struct Dispatch {
     userid: usize,
-    msg: Message,
+    bytes: Vec<u8>,
 }
 
 impl Dispatch {
-    pub fn new(userid: usize, msg: Message) -> Dispatch {
-        Dispatch { userid, msg }
-    }
-
-    pub fn into_msg(self) -> Message {
-        self.msg
+    pub fn new(userid: usize, bytes: Vec<u8>) -> Dispatch {
+        Dispatch { userid, bytes }
     }
 
     pub fn get_userid(&self) -> usize {
         self.userid
+    }
+
+    pub fn get_bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+
+    pub fn into_msg(self) -> Result<Message, MsgFromPaketError> {
+        Message::from_paket(self.bytes)
     }
 }
 
