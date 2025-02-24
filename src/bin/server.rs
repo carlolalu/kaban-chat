@@ -269,6 +269,6 @@ async fn client_rd_process(
 #[error(transparent)]
 enum ClientReaderError {
     SendToDispatcher(#[from] tokio::sync::mpsc::error::SendError<Dispatch>),
-    MsgDepaketer(#[from] MsgDepaketerError),
+    PaketsExtractor(#[from] PaketsExtractorError),
     Join(#[from] tokio::task::JoinError),
 }
