@@ -67,9 +67,22 @@ flowchart TB
     end
 ```
 
-## Notes for me
+## My Targets
 
-- test: you should write quite a lot of unit tests
-- implement error_handling: write your own errors or convert with anyhow crate? (search for `panic` and `unwrap`)
-- graceful shutdown: add the id pool and recall to check for the id_pool token redemption
-- id pool: it could be sharded to avoid bottlenecks if many client_handlers must access the same resource.
+- add the id pool and the id_pool token redemption for the graceful shutdown of client handlers in the server
+- update naming in README.md
+- merge all of this into the master branch
+
+- graceful shutdown for the whole client
+- graceful shutdown for the whole server
+- merge this into master
+
+- tracing in the lib
+- tracing in the client
+- tracing in the server
+
+After this the project can be considered finished. Future projects might be implementing new features on this structure,
+as for example:
+- adding a GUI
+- adding encryption
+- adding optimization of resources, letting tests be faster etc...
