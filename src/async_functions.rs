@@ -246,139 +246,241 @@ pub struct UnusualEmptyEntity {
 mod tests {
     use crate::prelude::*;
     use tokio::net::TcpStream;
+    use tokio::time::Duration;
+    use tokio_util::sync::CancellationToken;
     use tokio_util::task::TaskTracker;
 
     #[tokio::test]
     async fn test_pakets_extractor() {
         let num_messages = 100;
+        let mut msg_received = 0;
 
-        let paket: Vec<u8> = (0..num_messages)
+        let pakets: Vec<u8> = (0..num_messages)
             .map(|num| {
                 let username =
                     Username::new(&format!("user{}", num)).expect("This username is not valid");
-                let random_message = craft_random_msg(&username);
-                random_message.paket()
+                let prefix_len = "MESSAGE_n__[[[]]]\n".chars().count() + 1_usize + (num as f64).log10().floor() as usize;
+                // Sometimes the test fails for a too long paket. The frequency of this happening
+                // seems to drop when the length of these messages decreases.
+                let content = format!{"MESSAGE_n_{}_[[[{}]]]\n", num, craft_random_text_of_len(Message::MAX_CONTENT_LEN - prefix_len)};
+                let paket = Message::new(&username, &content).unwrap().paket();
+                paket
             })
             .flatten()
             .collect();
+        let reader = tokio_test::io::Builder::new().read(&pakets).build();
 
-        let reader = tokio_test::io::Builder::new().read(&paket).build();
+        let (tx, rx) = tokio::sync::mpsc::channel(20);
+        let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(20);
+        let cancellation_token = CancellationToken::new();
+        let cancellation_token_check = cancellation_token.clone();
+        let cancellation_token_control = cancellation_token.clone();
 
         let task_tracker = TaskTracker::new();
-        let mut handles = Vec::new();
 
-        handles.push(task_tracker.spawn(async move {
-            pakets_extractor(reader, tx)
-                .await
-                .expect("The message depaketer failed.");
-        }));
+        let handle_pakets_extractor = task_tracker.spawn(async move {
+            assert!(
+                pakets_extractor(reader, tx, cancellation_token)
+                    .await
+                    .is_ok(),
+                "The pakets_extractor yielded an error."
+            );
+            assert!(
+                cancellation_token_check.is_cancelled(),
+                "The paket extractor died before the cancellation token was cancelled."
+            );
+        });
 
-        handles.push(task_tracker.spawn(async move {
-            while let Some(paket) = rx.recv().await {
-                let message_result = Message::from_paket(paket);
-                assert!(message_result.is_ok());
-                if let Ok(_msg) = message_result {
-                    // println!("{}:> {}", _msg.get_username(), _msg.get_content());
+        let handle_pakets_receiver = task_tracker.spawn(async move {
+            let rx = rx.clone();
+
+            let begin_recv = tokio::time::Instant::now();
+
+            loop {
+                if let Some(paket) = rx.lock().await.recv().await {
+                    let message_result = Message::from_paket(paket);
+                    assert!(
+                        message_result.is_ok(),
+                        "The conversion from paket to message failed"
+                    );
+                    if let Ok(_msg) = message_result {
+                        msg_received += 1;
+                        // println!("{}:> {}", _msg.get_username(), _msg.get_content());
+                    }
+
+                    if msg_received == num_messages {
+                        break;
+                    } else if tokio::time::Instant::now().duration_since(begin_recv)
+                        > Duration::from_secs(3)
+                    {
+                        panic!("1 second passed and yet all messages are to arrive.")
+                    }
                 }
             }
-        }));
+
+            assert_eq!(
+                num_messages, msg_received,
+                "Not all messages were received."
+            );
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert!(
+            handle_pakets_receiver.is_finished(),
+            "The handle of the pakets-receiver did not finish yet, even though 0.1 seconds passed."
+        );
+
+        assert!(
+            handle_pakets_receiver.await.is_ok(),
+            "The pakets-receiver panicked."
+        );
+        assert!(
+            !handle_pakets_extractor.is_finished(),
+            "The paket extractor returned before its cancellation token was erased."
+        );
+
+        cancellation_token_control.cancel();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        assert!(handle_pakets_extractor.is_finished(), "The pakets_extractor did not finish, even though its cancellation token was erased 0.1 second ago.");
 
         task_tracker.close();
         task_tracker.wait().await;
-
-        for handle in handles {
-            if handle.await.is_err() {
-                panic!("One of the tasks panicked!")
-            }
-        }
     }
 
     #[tokio::test]
     async fn test_stdin2tcp() {
-        let num_messages_prompt = 100;
+        let num_messages_prompt_storm = 100;
 
-        let prompt_buffer0 = "Nam ignoratione rerum bonarum et malarum maxime
-hominum vita vexatur ob eumque errorem et voluptatibus
-maximis saepe privantur et durissimis animi doloribus
-torquentur.
-Ergo sapientia est adhibenda, quae et terroribus
-cupiditatibusque detractis et omnium falsarum opinionum
-temeritate derepta se nobis certissimam ducem praebeat ad
-voluptatem\n"
-            .to_string();
+        let prompt_storm = (1..=num_messages_prompt_storm).map(|num| -> Vec<char> {
+            let prefix_len = "MESSAGE_n__[[[]]]\n".chars().count() + 1_usize + (num as f64).log10().floor() as usize;
+            let prompt = format!{"MESSAGE_n_{}_[[[{}]]]\n", num, craft_random_text_of_len(Message::MAX_CONTENT_LEN - prefix_len)};
+            prompt.chars().collect()
+        }).flatten().collect::<String>();
 
-        let prompt_buffer1 = format!("{}\n", craft_random_text_of_len(Message::MAX_CONTENT_LEN));
+        let prompts = format!("helo\n{prompt_storm}");
 
-        let prompt_buffer2 = (1..=num_messages_prompt).map(|num| -> Vec<char> {
-        let prefix_len = "MESSAGE_n__[[[]]]\n".chars().count() + 1_usize + (num as f64).log10().floor() as usize;
-        let msg = format!{"MESSAGE_n_{}_[[[{}]]]\n", num, craft_random_text_of_len(Message::MAX_CONTENT_LEN - prefix_len)};
-        msg.chars().collect()
-    }).flatten().collect::<String>();
+        let num_messages = prompts.chars().filter(|&char| char == '\n').count();
 
         let stdin = tokio_test::io::Builder::new()
-            .read(prompt_buffer0.as_bytes())
-            .read(prompt_buffer1.as_bytes())
-            .read(prompt_buffer2.as_bytes())
+            .read(prompts.as_bytes())
             .build();
 
         let stdin = tokio::io::BufReader::new(stdin);
 
-        let (tx_depaketer, mut rx_depaketer) = tokio::sync::mpsc::channel::<Vec<u8>>(20);
+        let (tx_pakets_extractor, mut rx_pakets_extractor) =
+            tokio::sync::mpsc::channel::<Vec<u8>>(20);
+
+        let cancellation_token_pakets_extractor = CancellationToken::new();
+        let cancellation_token_pakets_extractor_control =
+            cancellation_token_pakets_extractor.clone();
+        let cancellation_token_pakets_extractor_check = cancellation_token_pakets_extractor.clone();
+
+        let cancellation_token_stdin2tcp = CancellationToken::new();
+        let cancellation_token_stdin2tcp_control = cancellation_token_stdin2tcp.clone();
+        let cancellation_token_stdin2tcp_check = cancellation_token_stdin2tcp.clone();
 
         let test_task_tracker = TaskTracker::new();
 
         // server
-        let server = test_task_tracker.spawn(async move {
+        let handle_server = test_task_tracker.spawn(async move {
             let listener = tokio::net::TcpListener::bind(constant::SERVER_ADDR)
                 .await
-                .expect("point0");
+                .expect("The tcp listener did not bind.");
 
-            let (socket_stream_server, _addr) = listener.accept().await.expect("point1");
-
-            pakets_extractor(socket_stream_server, tx_depaketer)
+            let (socket_stream_server, _addr) = listener
+                .accept()
                 .await
-                .unwrap();
+                .expect("The listener could not accept the incoming connection request.");
+
+            assert!(
+                pakets_extractor(
+                    socket_stream_server,
+                    tx_pakets_extractor,
+                    cancellation_token_pakets_extractor,
+                )
+                .await
+                .is_ok(),
+                "The paket extractor returned an error."
+            );
+
+            assert!(
+                cancellation_token_pakets_extractor_check.is_cancelled(),
+                "The paket extractor returned even though its cancellation token is still intact."
+            );
         });
 
         // client
-        let client = test_task_tracker.spawn(async move {
+        let handle_client = test_task_tracker.spawn(async move {
             let socket_stream_client = TcpStream::connect(constant::SERVER_ADDR)
                 .await
-                .expect("point2");
+                .expect("The client could not connect to the server.");
 
-            stdin2tcp(
+            assert!(stdin2tcp(
                 stdin,
                 socket_stream_client,
                 &Username::new("peppino").unwrap(),
-            )
-            .await
-            .expect("I just exited the message paketer with an error");
+                cancellation_token_stdin2tcp,
+            ).await.is_ok(), "The stdin2tcp function returned an error.");
+
+            assert!(cancellation_token_stdin2tcp_check.is_cancelled(), "The stdin2tcp function returned even though its cancellation token is still intact.");
         });
 
-        let messages = test_task_tracker.spawn(async move {
-            loop {
-                let paket = rx_depaketer
-                    .recv()
-                    .await
-                    .expect("something went wrong in the message transmission");
+        let cancellation_token_message_receiver = CancellationToken::new();
+        let cancellation_token_message_receiver_control =
+            cancellation_token_message_receiver.clone();
 
-                let msg_result = Message::from_paket(paket);
-                assert!(msg_result.is_ok());
-                if let Ok(_msg) = msg_result {
-                    // println!("{}:> {}", _msg.get_username(), _msg.get_content());
+        // message_receiver
+        let handle_message_receiver = test_task_tracker.spawn(async move {
+            let mut msg_count = 0;
+
+            loop {
+                if let Some(paket) = rx_pakets_extractor.recv().await {
+                    let msg_result = Message::from_paket(paket);
+                    assert!(msg_result.is_ok(), "The paket could not be converted successfully to a message.");
+                    if let Ok(_msg) = msg_result {
+                        msg_count += 1;
+                        // println!("{}:> {}", _msg.get_username(), _msg.get_content());
+                    }
+
+                    // if msg_count%5 == 0 { println!("The message receiver processed successfully 5 more pakets. The message count is {msg_count}."); }
+
+                    if msg_count == num_messages && cancellation_token_message_receiver.is_cancelled() {
+                        break
+                    }
                 }
             }
+
+            assert_eq!(msg_count, num_messages, "The number of messages sent by the server is bigger than the number of messages received by the client.");
         });
 
-        // todo: add graceful shutdown in the test as well: a clean "Ok" for the test is auspicable.
+        assert!(
+            !handle_server.is_finished(),
+            "The server returned before the message receiver"
+        );
+        assert!(
+            !handle_client.is_finished(),
+            "The client returned before the message receiver"
+        );
+
+        cancellation_token_message_receiver_control.cancel();
+        assert!(
+            handle_message_receiver.await.is_ok(),
+            "The message receiver returned an error."
+        );
+
+        cancellation_token_stdin2tcp_control.cancel();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(handle_client.is_finished(), "The handle_client did not finish, even though its cancellation token was erased 0.05 seconds ago.");
+
+        assert!(handle_client.await.is_ok(), "The client returned an error.");
+
+        cancellation_token_pakets_extractor_control.cancel();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(handle_server.is_finished(), "The server did not finish, even though its cancellation token was erased 0.05 seconds ago.");
 
         test_task_tracker.close();
         test_task_tracker.wait().await;
-
-        if server.await.is_err() || client.await.is_err() || messages.await.is_err() {
-            panic!("One of the two handles panicked");
-        }
     }
 }
