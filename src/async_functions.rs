@@ -1,11 +1,11 @@
 use crate::prelude::*;
-use std::io::Write;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync,
 };
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 // ############################## ASYNC READ AND WRITE FUNCTIONS ##############################
 
@@ -13,14 +13,20 @@ use tokio_stream::StreamExt;
 pub async fn pakets_extractor(
     mut tcp_reader: impl AsyncRead + Unpin + Send + 'static,
     tx: sync::mpsc::Sender<Vec<u8>>,
-    // cancellation token
-) -> Result<(), MsgDepaketerError> {
+    cancellation_token: CancellationToken,
+) -> Result<(), PaketsExtractorError> {
     let mut buffer: Vec<u8> = Vec::with_capacity(Message::INCOMING_MSG_BUFFER_U8_LEN);
     let mut previous_fragment: Vec<u8> = Vec::with_capacity(Message::INCOMING_MSG_BUFFER_U8_LEN);
 
-    'write_on_buffer: loop {
+    let outcome = 'writing_on_buffer: loop {
         buffer.clear();
-        match tcp_reader.read_buf(&mut buffer).await {
+
+        let result_tcp_read = tokio::select! {
+            result_tcp_read = tcp_reader.read_buf(&mut buffer) => result_tcp_read,
+            _cancellation = cancellation_token.cancelled() => break 'writing_on_buffer Ok(()),
+        };
+
+        match result_tcp_read {
             Ok(n) if n > 0 => {
                 // Loop assumption: previous_fragment is initialised (eventually empty)
 
@@ -36,7 +42,7 @@ pub async fn pakets_extractor(
                             entity: "actual_fragments".to_string(),
                         };
                         eprint_small_error(err);
-                        continue 'write_on_buffer;
+                        continue 'writing_on_buffer;
                     }
                 };
 
@@ -52,7 +58,7 @@ pub async fn pakets_extractor(
                     let (last_fragment, middle_fragments) = match subsequent_fragments.split_last()
                     {
                         Some(smt) => (*smt.0, smt.1),
-                        None => continue 'write_on_buffer,
+                        None => continue 'writing_on_buffer,
                     };
 
                     let mut stream = tokio_stream::iter(middle_fragments);
@@ -72,31 +78,70 @@ pub async fn pakets_extractor(
                                 entity: "last_fragment".to_string(),
                             };
                             eprint_small_error(err);
-                            continue 'write_on_buffer;
+                            continue 'writing_on_buffer;
                         }
                     }
                 } else {
                     previous_fragment.append(&mut first_fragment.to_vec());
 
                     if previous_fragment.len() > Message::MAX_PAKET_U8_LEN {
-                        let err = MsgDepaketerError::TooLongPaket {
+                        let err = PaketsExtractorError::TooLongPaket {
                             paket_u8_len: previous_fragment.len(),
                         };
                         eprint_small_error(err);
-                        previous_fragment.clear()
+
+                        previous_fragment.clear();
+                        'reinitialising_previous_fragment: loop {
+                            buffer.clear();
+                            match tcp_reader.read_buf(&mut buffer).await {
+                                Ok(n) if n > 0 => {
+                                    if buffer.contains(&Message::PAKET_END_U8) {
+                                        let fragments: Vec<&[u8]> = buffer
+                                            .splitn(2, |&byte| byte == Message::PAKET_END_U8)
+                                            .collect();
+                                        *previous_fragment = match fragments.get(1) {
+                                            Some(&slice) => slice.to_vec(),
+                                            None => {
+                                                let err = UnusualEmptyEntity {
+                                                    entity: "slice in the loop <'reinitialising_previous_fragment>".to_string(),
+                                                };
+                                                eprint_small_error(err);
+                                                continue 'writing_on_buffer;
+                                            }
+                                        }
+                                    } else {
+                                        continue 'reinitialising_previous_fragment;
+                                    }
+                                }
+                                Ok(_zero) => continue 'writing_on_buffer,
+                                Err(err) => {
+                                    break 'writing_on_buffer Err(PaketsExtractorError::Io(err))
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Ok(_zero) => break 'write_on_buffer,
-            Err(err) => return Err(MsgDepaketerError::Io(err)),
+            Ok(_zero) => {
+                let err = Err(PaketsExtractorError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "The tcp reader read 0 bytes: the connection was interrupted.",
+                )));
+                eprint_small_error(err);
+                break 'writing_on_buffer Ok(());
+            }
+            Err(err) => break 'writing_on_buffer Err(PaketsExtractorError::Io(err)),
         }
-    }
-    Ok(())
+    };
+
+    cancellation_token.cancel();
+
+    outcome
 }
 
 #[derive(Error, Debug)]
 #[error(transparent)]
-pub enum MsgDepaketerError {
+pub enum PaketsExtractorError {
     Io(#[from] std::io::Error),
     TxSend(#[from] tokio::sync::mpsc::error::SendError<Vec<u8>>),
     #[error("A too long paket arrived, it had {paket_u8_len} bytes. Such paket will be dropped.")]
@@ -111,27 +156,33 @@ pub async fn stdin2tcp(
     mut stdin: impl AsyncRead + Unpin,
     mut tcp_writer: impl AsyncWrite + Unpin,
     username: &Username,
-    // cancellation_token: CancellationToken
-) -> Result<(), MsgPaketerError> {
+    cancellation_token: CancellationToken,
+) -> Result<(), Stdin2TcpError> {
     let mut prompt_buffer: Vec<u8> = Vec::with_capacity(Message::OUTGOING_MSG_BUFFER_U8_LEN);
     let mut prompt: Vec<u8> = Vec::with_capacity(Message::OUTGOING_MSG_BUFFER_U8_LEN * 30);
+    let mut stdout = tokio::io::stdout();
+    let username_prompt = format!("{username}:> ");
 
     let prompt = &mut prompt;
 
     'accepting_new_prompt: loop {
-        print!("{username}:> ");
-        match std::io::stdout().flush() {
-            Ok(()) => (),
-            Err(err) => {
-                eprint_small_error(err);
-                continue 'accepting_new_prompt;
-            }
+        tokio::select! {
+            result_prompt = stdout.write_all(username_prompt.as_bytes()) => {
+                match result_prompt {
+                    Ok(()) => (),
+                    Err(err) => {
+                        eprint_small_error(err);
+                        continue 'accepting_new_prompt;
+                    },
+                }
+            },
+            _cancellation = cancellation_token.cancelled() => break 'accepting_new_prompt,
         }
 
         prompt.clear();
 
         // Build a Vec<String> where each String has at most Message::MAX_CONTENT_LEN chars
-        'stringigy_prompt_buffer: loop {
+        'gathering_prompt_buffer: loop {
             prompt_buffer.clear();
 
             match stdin.read_buf(&mut prompt_buffer).await {
@@ -150,16 +201,16 @@ pub async fn stdin2tcp(
                         .collect();
 
                     if is_last_chunk || prompt_buffer.is_empty() {
-                        break 'stringigy_prompt_buffer;
+                        break 'gathering_prompt_buffer;
                     }
                 }
-                // todo: handle the transmission of 0 bytes with graceful shutdown. It is an
-                // ambigous outcome: the tokio documentation claims this means an EOF and thus
-                // that the reader could still return something, while the empirics tells me that
-                // this happens only when the reader is unlinked from its source. I should verify.
-                Ok(_null) => continue 'stringigy_prompt_buffer,
-                Err(error) => return Err(MsgPaketerError::from(error)),
+                Ok(_zero) => break 'gathering_prompt_buffer,
+                Err(error) => return Err(Stdin2TcpError::from(error)),
             }
+        }
+
+        if prompt.is_empty() {
+            continue 'accepting_new_prompt;
         }
 
         let text = match String::from_utf8(prompt.to_vec()) {
@@ -178,14 +229,14 @@ pub async fn stdin2tcp(
         tcp_writer.write_all(&pakets).await?;
     }
 
-    // remove this when adding graceful shutdown
-    #[allow(unreachable_code)]
+    cancellation_token.cancel();
+
     Ok(())
 }
 
 #[derive(Error, Debug)]
 #[error(transparent)]
-pub enum MsgPaketerError {
+pub enum Stdin2TcpError {
     Io(#[from] std::io::Error),
     TxReceive(#[from] tokio::sync::mpsc::error::TryRecvError),
 }
@@ -327,6 +378,7 @@ voluptatem\n"
                 }
             }
         });
+
         // todo: add graceful shutdown in the test as well: a clean "Ok" for the test is auspicable.
 
         test_task_tracker.close();
