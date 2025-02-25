@@ -7,12 +7,11 @@ use tokio::{
     io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     sync,
+    task::JoinSet,
 };
 
 use thiserror::Error;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 // ############################## MAIN ##############################
 
@@ -101,7 +100,7 @@ async fn server_manager(
             or the userid reached its maximum.");
             break;
         }
-        let (stream, addr) = match listener.accept().await {
+        let (tcp_stream, addr) = match listener.accept().await {
             Ok(connection_data) => connection_data,
             Err(err) => {
                 eprint_small_error(err);
@@ -116,7 +115,7 @@ async fn server_manager(
 
         joinset_server_manager.spawn(async move {
             client_handler(
-                stream,
+                tcp_stream,
                 client_handler_tx,
                 client_handler_rx,
                 addr,
@@ -133,7 +132,7 @@ async fn server_manager(
     Ok(())
 }
 
-/// The client handler divides the stream into reader and writer, and then spawns two tasks handling them.
+/// The client handler divides the tcp_stream into reader and writer, and then spawns two tasks handling them.
 async fn client_handler(
     tcp_stream: impl AsyncWrite + AsyncRead + std::marker::Send + 'static,
     client_handler_tx: sync::mpsc::Sender<Dispatch>,
@@ -270,12 +269,36 @@ async fn client_rd_process(
     });
 
     let handle_sender = tasktracker_client_rd_handler.spawn(async move {
+        let first_paket = match pakets_rx.recv().await {
+            Some(paket) => paket,
+            None => return Err(ClientReaderError::NoHelo {cause: "The channel receiving the extracted pakets is closed.".to_string()}),
+        };
+
+        let first_msg = match Message::from_paket(first_paket) {
+            Ok(msg) => msg,
+            Err(_err) => return Err(ClientReaderError::NoHelo {cause: "The first paket received could not be converted to a message.".to_string()}),
+        };
+
+        let username = if &first_msg.get_content() != "helo" {
+            return Err(ClientReaderError::NoHelo {cause: "The content of the first message was not 'helo' as it was supposed to be.".to_string()});
+        } else {
+            first_msg.get_username()
+        };
+
+        let welcome_message = Message::craft_msg_change_status(&username, UserStatus::Present);
+        let welcome_dispatch = Dispatch::new(userid, welcome_message.paket());
+        client_handler_tx.send(welcome_dispatch).await?;
+
         'reading_messages: loop {
             let maybe_bytes = tokio::select! {
                 result_receive_pakets_from_tcp_reader = pakets_rx.recv() => {
                     result_receive_pakets_from_tcp_reader
                 },
                 _ = cancellation_sender.cancelled() => {
+                    let goodbye_msg = Message::craft_msg_change_status(&username, UserStatus::Absent);
+                    let goodbye_dispatch = Dispatch::new(userid, goodbye_msg.paket());
+                    client_handler_tx.send(goodbye_dispatch).await?;
+
                     break 'reading_messages;
                 },
             };
@@ -309,6 +332,10 @@ async fn client_rd_process(
 #[derive(Error, Debug)]
 #[error(transparent)]
 enum ClientReaderError {
+    #[error("Could not receive the 'helo' message from the client. The cause was: [[{cause}]]")]
+    NoHelo {
+        cause: String,
+    },
     SendToDispatcher(#[from] tokio::sync::mpsc::error::SendError<Dispatch>),
     PaketsExtractor(#[from] PaketsExtractorError),
     Join(#[from] tokio::task::JoinError),
