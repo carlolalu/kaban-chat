@@ -101,6 +101,8 @@ impl Message {
     pub(crate) const OUTGOING_MSG_BUFFER_U8_LEN: usize = 1000_usize;
 
     pub(crate) fn new(username: &Username, content: &str) -> Result<Message, TextValidityError> {
+        assert!(Message::MAX_OFFICIAL_CONTENT_LEN < Message::MAX_CONTENT_LEN);
+
         if content.chars().count() > Message::MAX_CONTENT_LEN {
             return Err(TextValidityError::TooLong {
                 kind_of_entity: "content".to_string(),
@@ -199,8 +201,14 @@ pub enum UserStatus {
 // Message::new may fail is due to the length of its content.
 /// This collection gathers the functions which create 'official' messages.
 impl Message {
+    pub const MAX_OFFICIAL_CONTENT_LEN: usize = 100;
+    pub const MAX_OFFICIAL_PAKET_U8_LEN: usize =
+        Message::MAX_OFFICIAL_CONTENT_LEN * (4 + 1) + Username::MAX_LEN * (4 + 1) + 40;
+
     pub fn craft_msg_helo(username: &Username) -> Message {
-        Message::new(username, "helo").unwrap()
+        let content = "helo".to_string();
+        assert!(content.chars().count() <= Message::MAX_OFFICIAL_CONTENT_LEN);
+        Message::new(username, &content).unwrap()
     }
 
     pub fn craft_msg_change_status(username: &Username, new_status: UserStatus) -> Message {
@@ -208,11 +216,13 @@ impl Message {
             UserStatus::Present => format!("{username} just joined the chat"),
             UserStatus::Absent => format!("{username} just left the chat"),
         };
+        assert!(content.chars().count() <= Message::MAX_OFFICIAL_CONTENT_LEN);
         Message::new(&Username("SERVER".to_string()), &content).unwrap()
     }
 
     pub fn craft_msg_server_interrupt_connection() -> Message {
         let content = "The SERVER is shutting down this connection.".to_string();
+        assert!(content.chars().count() <= Message::MAX_OFFICIAL_CONTENT_LEN);
         Message::new(&Username("SERVER".to_string()), &content).unwrap()
     }
 }
