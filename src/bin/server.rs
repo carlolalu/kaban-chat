@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync,
 };
 
 use thiserror::Error;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 // ############################## MAIN ##############################
@@ -134,7 +135,7 @@ async fn server_manager(
 
 /// The client handler divides the stream into reader and writer, and then spawns two tasks handling them.
 async fn client_handler(
-    stream: TcpStream,
+    tcp_stream: impl AsyncWrite + AsyncRead + std::marker::Send + 'static,
     client_handler_tx: sync::mpsc::Sender<Dispatch>,
     client_handler_rx: sync::broadcast::Receiver<Dispatch>,
     address: std::net::SocketAddr,
@@ -142,15 +143,31 @@ async fn client_handler(
 ) -> Result<(), ClientHandlerError> {
     let tasktracker_client_handler = TaskTracker::new();
 
-    let (tcp_rd, tcp_wr) = io::split(stream);
+    let (tcp_rd, tcp_wr) = io::split(tcp_stream);
+
+    let client_cancellation = CancellationToken::new();
+    let reader_cancellation_controller = client_cancellation.clone();
+    let writer_cancellation_controller = client_cancellation.clone();
 
     let handle_writer = tasktracker_client_handler.spawn(async move {
-        client_wr_process(tcp_wr, client_handler_rx, userid).await?;
+        client_wr_process(
+            tcp_wr,
+            client_handler_rx,
+            userid,
+            writer_cancellation_controller,
+        )
+        .await?;
         Ok::<(), ClientHandlerErrorCause>(())
     });
 
     let handle_reader = tasktracker_client_handler.spawn(async move {
-        client_rd_process(tcp_rd, client_handler_tx, userid).await?;
+        client_rd_process(
+            tcp_rd,
+            client_handler_tx,
+            userid,
+            reader_cancellation_controller,
+        )
+        .await?;
         Ok::<(), ClientHandlerErrorCause>(())
     });
 
@@ -161,7 +178,11 @@ async fn client_handler(
         join_result = handle_writer => {
             join_result
         },
+        // here add another arm for the general_graceful_shutdown_token, when the time comes
+        // this one should call the client_cancellation_token.cancel()
     };
+
+    client_cancellation.cancel();
 
     let final_result = match first_finished {
         Ok(join_output) => match join_output {
@@ -202,17 +223,23 @@ async fn client_wr_process(
     mut tcp_wr: impl AsyncWrite + Unpin,
     mut client_handler_rx: sync::broadcast::Receiver<Dispatch>,
     userid: usize,
+    cancellation_token: CancellationToken,
 ) -> Result<(), ClientWriterError> {
-    loop {
-        let dispatch = client_handler_rx.recv().await?;
+    'writing_pakets_into_tcp: loop {
+        let dispatch = tokio::select! {
+            maybe_dispatch = client_handler_rx.recv() => {
+                maybe_dispatch?
+            },
+            _cancellation = cancellation_token.cancelled() => {
+                break 'writing_pakets_into_tcp;
+            }
+        };
 
         if dispatch.get_userid() != userid {
             tcp_wr.write_all(&dispatch.get_bytes()).await?;
         }
     }
 
-    // remove with graceful shutdown
-    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -227,26 +254,38 @@ async fn client_rd_process(
     tcp_rd: impl AsyncRead + Unpin + Send + 'static,
     client_handler_tx: sync::mpsc::Sender<Dispatch>,
     userid: usize,
+    cancellation_token: CancellationToken,
 ) -> Result<(), ClientReaderError> {
     let pakets_buffer_len = 30;
     let (pakets_tx, mut pakets_rx) = sync::mpsc::channel(pakets_buffer_len);
 
     let tasktracker_client_rd_handler = TaskTracker::new();
 
+    let paket_extractor_cancellation = cancellation_token.clone();
+    let cancellation_sender = cancellation_token.clone();
+
     let handle_pakets_extractor = tasktracker_client_rd_handler.spawn(async move {
-        pakets_extractor(tcp_rd, pakets_tx).await?;
+        pakets_extractor(tcp_rd, pakets_tx, paket_extractor_cancellation).await?;
         Ok::<(), ClientReaderError>(())
     });
 
     let handle_sender = tasktracker_client_rd_handler.spawn(async move {
-        loop {
-            if let Some(bytes) = pakets_rx.recv().await {
+        'reading_messages: loop {
+            let maybe_bytes = tokio::select! {
+                result_receive_pakets_from_tcp_reader = pakets_rx.recv() => {
+                    result_receive_pakets_from_tcp_reader
+                },
+                _ = cancellation_sender.cancelled() => {
+                    break 'reading_messages;
+                },
+            };
+
+            if let Some(bytes) = maybe_bytes {
                 let dispatch = Dispatch::new(userid, bytes);
                 client_handler_tx.send(dispatch).await?;
             }
         }
-        // remove with graceful shutdown
-        #[allow(unreachable_code)]
+
         Ok::<(), ClientReaderError>(())
     });
 
@@ -258,6 +297,8 @@ async fn client_rd_process(
             join_result??
         },
     }
+
+    cancellation_token.cancel();
 
     tasktracker_client_rd_handler.close();
     tasktracker_client_rd_handler.wait().await;
