@@ -89,8 +89,13 @@ impl Message {
     };
 
     /// The magic number 40 is here a rough estimate for the byte needed for the serde JSON
-    /// encapsulation ('\n', '"', '{' '}' etc...)
-    pub const MAX_PAKET_U8_LEN: usize = Message::MAX_CONTENT_LEN * 4 + Username::MAX_LEN * 4 + 40;
+    /// encapsulation ('\n', '"', '{' '}' etc...). The '_LEN' constant must be multiplied for 4
+    /// because that is the maximum length in bytes (u8) of a char in Rust. But if such char is a
+    /// special one (e.g. '"'), then the serde library must put a '\' before it, and this means that
+    /// in its serialised version there is 1 more byte, which means that each char is at most (4+1)
+    /// bytes long.
+    pub const MAX_PAKET_U8_LEN: usize =
+        Message::MAX_CONTENT_LEN * (4 + 1) + Username::MAX_LEN * (4 + 1) + 40;
 
     pub(crate) const INCOMING_MSG_BUFFER_U8_LEN: usize = 1000_usize;
     pub(crate) const OUTGOING_MSG_BUFFER_U8_LEN: usize = 1000_usize;
