@@ -113,6 +113,8 @@ async fn server_manager(
 
         let client_handler_rx = dispatcher_subscriber.subscribe();
 
+        println!("A new client at {addr} will be served!");
+
         joinset_server_manager.spawn(async move {
             client_handler(
                 tcp_stream,
@@ -284,6 +286,8 @@ async fn client_rd_process(
         } else {
             first_msg.get_username()
         };
+        // debug
+        println!("The helo message was received");
 
         let welcome_message = Message::craft_msg_change_status(&username, UserStatus::Present);
         let welcome_dispatch = Dispatch::new(userid, welcome_message.paket());
@@ -296,6 +300,10 @@ async fn client_rd_process(
                 },
                 _ = cancellation_sender.cancelled() => {
                     let goodbye_msg = Message::craft_msg_change_status(&username, UserStatus::Absent);
+
+                    //debug
+                    println!("The goodbye message was sent to all others");
+
                     let goodbye_dispatch = Dispatch::new(userid, goodbye_msg.paket());
                     client_handler_tx.send(goodbye_dispatch).await?;
 
