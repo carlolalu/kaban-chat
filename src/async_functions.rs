@@ -23,6 +23,9 @@ pub async fn pakets_extractor(
 
         let result_tcp_read = tokio::select! {
             result_tcp_read = tcp_reader.read_buf(&mut buffer) => result_tcp_read,
+
+            // todo: are we sure we just wanna drop the whole function wihtout waiting for all
+            // pakets to arrive, i.e. for the tcp_reader to not return bytes anymore? Is it possible to do it, or would the call remain eternally suspended?
             _cancellation = cancellation_token.cancelled() => break 'writing_on_buffer Ok(()),
         };
 
@@ -30,78 +33,10 @@ pub async fn pakets_extractor(
             Ok(n) if n > 0 => {
                 // Loop assumption: previous_fragment is initialised (eventually empty)
 
-                let previous_fragment = &mut previous_fragment;
-                let actual_fragments: Vec<&[u8]> = buffer
-                    .split_inclusive(|&byte| byte == Message::PAKET_END_U8)
-                    .collect();
-
-                let (first_fragment, subsequent_fragments) = match actual_fragments.split_first() {
-                    Some(smt) => (*smt.0, smt.1),
-                    None => {
-                        let err = UnusualEmptyEntity {
-                            entity: "actual_fragments".to_string(),
-                        };
-                        eprint_small_error(err);
-                        continue 'writing_on_buffer;
-                    }
-                };
-
-                if Some(&Message::PAKET_END_U8) == first_fragment.last() {
-                    let first_paket_candidate = previous_fragment
-                        .iter()
-                        .chain(first_fragment.iter())
-                        .map(|&byte| byte)
-                        .collect();
-
-                    tx.send(first_paket_candidate).await?;
-
-                    let (last_fragment, middle_fragments) = match subsequent_fragments.split_last()
-                    {
-                        Some(smt) => (*smt.0, smt.1),
-                        None => continue 'writing_on_buffer,
-                    };
-
-                    let mut stream = tokio_stream::iter(middle_fragments);
-                    while let Some(&fragment) = stream.next().await {
-                        tx.send(fragment.to_vec()).await?;
-                    }
-
-                    // The loop assumptions are fulfilled here
-                    match last_fragment.last() {
-                        Some(&ch) if ch == Message::PAKET_END_U8 => {
-                            tx.send(last_fragment.to_vec()).await?;
-                            previous_fragment.clear()
-                        }
-                        Some(&_ch) => *previous_fragment = last_fragment.to_vec(),
-                        None => {
-                            let err = UnusualEmptyEntity {
-                                entity: "last_fragment".to_string(),
-                            };
-                            eprint_small_error(err);
-                            continue 'writing_on_buffer;
-                        }
-                    }
-                } else {
-                    previous_fragment.append(&mut first_fragment.to_vec());
-
-                    if previous_fragment.len() > Message::MAX_PAKET_U8_LEN {
-                        let err = PaketsExtractorError::TooLongPaket {
-                            paket_u8_len: previous_fragment.len(),
-                        };
-                        eprint_small_error(err);
-
-                        let reinitialization_outcome = reinitialize_previous_fragment(
-                            previous_fragment,
-                            &mut tcp_reader,
-                            &mut buffer,
-                        )
-                        .await;
-
-                        if reinitialization_outcome.is_err() {
-                            break 'writing_on_buffer reinitialization_outcome;
-                        }
-                    }
-                }
+                // todo: write the algorithm here and depending on what you return break the loop or not. document this function very well.
+                process_pakets_buffer(&mut previous_fragment, &mut buffer, &mut tcp_reader, &tx).await;
+                // TODO: make something depending on the error returned by the function above
+                // If I return Ok then I should just continue, otherwise depending on the error I should do smt similar
             }
             Ok(_zero) => {
                 let err = Err(PaketsExtractorError::Io(std::io::Error::new(
@@ -118,6 +53,79 @@ pub async fn pakets_extractor(
     cancellation_token.cancel();
 
     outcome
+}
+
+async fn process_pakets_buffer(previous_fragment: &mut Vec<u8>, buffer: &mut Vec<u8>, tcp_reader: &mut (impl AsyncRead + Unpin + Send + 'static), tx: &sync::mpsc::Sender<Vec<u8>>) -> Result<(), // which type of error do I want
+> {
+    let actual_fragments: Vec<&[u8]> = buffer
+        .split_inclusive(|&byte| byte == Message::PAKET_END_U8)
+        .collect();
+
+    let (first_fragment, subsequent_fragments) = match actual_fragments.split_first() {
+        Some(smt) => (*smt.0, smt.1),
+        None => {
+            eprint_small_error(UnusualEmptyEntity {
+                entity: "actual_fragments".to_string(),
+            });
+            return Ok(());
+        }
+    };
+
+    if Some(&Message::PAKET_END_U8) == first_fragment.last() {
+        let first_paket_candidate = previous_fragment
+            .iter()
+            .chain(first_fragment.iter())
+            .map(|&byte| byte)
+            .collect();
+
+        tx.send(first_paket_candidate).await?;
+
+        let (last_fragment, middle_fragments) = match subsequent_fragments.split_last()
+        {
+            Some(smt) => (*smt.0, smt.1),
+            None => return Ok(()),
+        };
+
+        let mut stream = tokio_stream::iter(middle_fragments);
+        while let Some(&fragment) = stream.next().await {
+            tx.send(fragment.to_vec()).await?;
+        }
+
+        // The loop assumptions are fulfilled here
+        match last_fragment.last() {
+            Some(&ch) if ch == Message::PAKET_END_U8 => {
+                tx.send(last_fragment.to_vec()).await?;
+                previous_fragment.clear()
+            }
+            Some(&_ch) => *previous_fragment = last_fragment.to_vec(),
+            None => {
+                eprint_small_error(UnusualEmptyEntity {
+                    entity: "last_fragment".to_string(),
+                });
+                return Ok(());
+            }
+        }
+    } else {
+        previous_fragment.append(&mut first_fragment.to_vec());
+
+        if previous_fragment.len() > Message::MAX_PAKET_U8_LEN {
+            let err = PaketsExtractorError::TooLongPaket {
+                paket_u8_len: previous_fragment.len(),
+            };
+            eprint_small_error(err);
+
+            let reinitialization_outcome = reinitialize_previous_fragment(
+                previous_fragment,
+                tcp_reader,
+                buffer,
+            ).await;
+
+            if reinitialization_outcome.is_err() {
+                return reinitialization_outcome;
+            }
+        }
+    }
+    Ok(())
 }
 
 
