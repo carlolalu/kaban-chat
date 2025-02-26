@@ -18,12 +18,12 @@ pub async fn pakets_extractor(
     let mut buffer: Vec<u8> = Vec::with_capacity(Message::INCOMING_MSG_BUFFER_U8_LEN);
     let mut previous_fragment: Vec<u8> = Vec::with_capacity(Message::INCOMING_MSG_BUFFER_U8_LEN);
 
-    let outcome = 'write_on_buffer: loop {
+    let outcome = 'writing_on_buffer: loop {
         buffer.clear();
 
         let result_tcp_read = tokio::select! {
             result_tcp_read = tcp_reader.read_buf(&mut buffer) => result_tcp_read,
-            _cancellation = cancellation_token.cancelled() => break 'write_on_buffer Ok(()),
+            _cancellation = cancellation_token.cancelled() => break 'writing_on_buffer Ok(()),
         };
 
         match result_tcp_read {
@@ -42,7 +42,7 @@ pub async fn pakets_extractor(
                             entity: "actual_fragments".to_string(),
                         };
                         eprint_small_error(err);
-                        continue 'write_on_buffer;
+                        continue 'writing_on_buffer;
                     }
                 };
 
@@ -58,7 +58,7 @@ pub async fn pakets_extractor(
                     let (last_fragment, middle_fragments) = match subsequent_fragments.split_last()
                     {
                         Some(smt) => (*smt.0, smt.1),
-                        None => continue 'write_on_buffer,
+                        None => continue 'writing_on_buffer,
                     };
 
                     let mut stream = tokio_stream::iter(middle_fragments);
@@ -78,7 +78,7 @@ pub async fn pakets_extractor(
                                 entity: "last_fragment".to_string(),
                             };
                             eprint_small_error(err);
-                            continue 'write_on_buffer;
+                            continue 'writing_on_buffer;
                         }
                     }
                 } else {
@@ -106,24 +106,24 @@ pub async fn pakets_extractor(
                                                     entity: "slice in the loop <'reinitialising_previous_fragment>".to_string(),
                                                 };
                                                 eprint_small_error(err);
-                                                continue 'write_on_buffer;
+                                                continue 'writing_on_buffer;
                                             }
                                         }
                                     } else {
                                         continue 'reinitialising_previous_fragment;
                                     }
                                 }
-                                Ok(_zero) => continue 'write_on_buffer,
+                                Ok(_zero) => continue 'writing_on_buffer,
                                 Err(err) => {
-                                    break 'write_on_buffer Err(PaketsExtractorError::Io(err))
+                                    break 'writing_on_buffer Err(PaketsExtractorError::Io(err))
                                 }
                             }
                         }
                     }
                 }
             }
-            Ok(_zero) => continue 'write_on_buffer,
-            Err(err) => break 'write_on_buffer Err(PaketsExtractorError::Io(err)),
+            Ok(_zero) => break 'writing_on_buffer Err(PaketsExtractorError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "The tcp reader read 0 bytes: the connection was interrupted."))),
+            Err(err) => break 'writing_on_buffer Err(PaketsExtractorError::Io(err)),
         }
     };
 
