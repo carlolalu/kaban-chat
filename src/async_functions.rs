@@ -120,6 +120,11 @@ pub async fn pakets_extractor(
     outcome
 }
 
+
+// TODO: this algorithm is wrong: if you divide the buffer in two at first end symbol, what happens is that
+// previous_fragment might get not just one paket, but many, breaking the assumption on the next cycle.
+// This must be done otherwise and MORE ORDERLY.
+
 /// If the pakets_extractor drops a paket due to some errors, it is important to reinitialise
 /// 'previous_fragment'.
 async fn reinitialize_previous_fragment(
