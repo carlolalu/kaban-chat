@@ -90,34 +90,15 @@ pub async fn pakets_extractor(
                         };
                         eprint_small_error(err);
 
-                        previous_fragment.clear();
-                        'reinitialising_previous_fragment: loop {
-                            buffer.clear();
-                            match tcp_reader.read_buf(&mut buffer).await {
-                                Ok(n) if n > 0 => {
-                                    if buffer.contains(&Message::PAKET_END_U8) {
-                                        let fragments: Vec<&[u8]> = buffer
-                                            .splitn(2, |&byte| byte == Message::PAKET_END_U8)
-                                            .collect();
-                                        *previous_fragment = match fragments.get(1) {
-                                            Some(&slice) => slice.to_vec(),
-                                            None => {
-                                                let err = UnusualEmptyEntity {
-                                                    entity: "slice in the loop <'reinitialising_previous_fragment>".to_string(),
-                                                };
-                                                eprint_small_error(err);
-                                                continue 'writing_on_buffer;
-                                            }
-                                        }
-                                    } else {
-                                        continue 'reinitialising_previous_fragment;
-                                    }
-                                }
-                                Ok(_zero) => continue 'writing_on_buffer,
-                                Err(err) => {
-                                    break 'writing_on_buffer Err(PaketsExtractorError::Io(err))
-                                }
-                            }
+                        let reinitialization_outcome = reinitialize_previous_fragment(
+                            previous_fragment,
+                            &mut tcp_reader,
+                            &mut buffer,
+                        )
+                        .await;
+
+                        if reinitialization_outcome.is_err() {
+                            break 'writing_on_buffer reinitialization_outcome;
                         }
                     }
                 }
@@ -137,6 +118,43 @@ pub async fn pakets_extractor(
     cancellation_token.cancel();
 
     outcome
+}
+
+/// If the pakets_extractor drops a paket due to some errors, it is important to reinitialise
+/// 'previous_fragment'.
+async fn reinitialize_previous_fragment(
+    previous_fragment: &mut Vec<u8>,
+    tcp_reader: &mut (impl AsyncRead + Unpin + Send + 'static),
+    buffer: &mut Vec<u8>,
+) -> Result<(), PaketsExtractorError> {
+    previous_fragment.clear();
+    'reinitialising_previous_fragment: loop {
+        buffer.clear();
+        match tcp_reader.read_buf(buffer).await {
+            Ok(n) if n > 0 => {
+                if buffer.contains(&Message::PAKET_END_U8) {
+                    let fragments: Vec<&[u8]> = buffer
+                        .splitn(2, |&byte| byte == Message::PAKET_END_U8)
+                        .collect();
+                    *previous_fragment = match fragments.get(1) {
+                        Some(&slice) => slice.to_vec(),
+                        None => {
+                            let err = UnusualEmptyEntity {
+                                entity: "slice in the loop <'reinitialising_previous_fragment>"
+                                    .to_string(),
+                            };
+                            eprint_small_error(err);
+                            continue 'reinitialising_previous_fragment;
+                        }
+                    }
+                } else {
+                    continue 'reinitialising_previous_fragment;
+                }
+            }
+            Ok(_zero) => return Ok(()),
+            Err(err) => return Err(PaketsExtractorError::Io(err)),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
