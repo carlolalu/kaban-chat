@@ -340,3 +340,62 @@ enum ClientReaderError {
     PaketsExtractor(#[from] PaketsExtractorError),
     Join(#[from] tokio::task::JoinError),
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn tcp_rd_receives_helo() {
+        let username = Username::new("peppino").expect("This username is too long!");
+
+        let helo_paket = Message::craft_msg_helo(&username).paket();
+
+        let tcp_reader = tokio_test::io::Builder::new().read(&helo_paket).build();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Dispatch>(5);
+        let cancellation_token = CancellationToken::new();
+        let cancellation_controller = cancellation_token.clone();
+
+        let task_tracker = TaskTracker::new();
+
+        let handle_dispatch_receiver = task_tracker.spawn(async move {
+            let message_content = match rx.recv().await {
+                Some(dispatch) => dispatch
+                    .into_msg()
+                    .expect("The dispatch conversion into message yielded an Error.")
+                    .get_content(),
+                None => panic!("No dispatch received!"),
+            };
+
+            // println!("{}:> {}", message.get_username(), message.get_content());
+
+            let expected_content = format!("{username} just joined the chat");
+
+            assert_eq!(
+                message_content, expected_content,
+                "The content of the message received is not helo"
+            );
+        });
+
+        let handle_tcp_reader_process = task_tracker.spawn(async move {
+            client_rd_process(tcp_reader, tx, 1, cancellation_token).await?;
+            Ok::<(), ClientReaderError>(())
+        });
+
+        task_tracker.close();
+
+        assert!(
+            handle_dispatch_receiver.await.is_ok(),
+            "The dispatch receiver encountered an error."
+        );
+        cancellation_controller.cancel();
+
+        assert!(tokio::time::timeout(
+            tokio::time::Duration::from_millis(10),
+            handle_tcp_reader_process
+        )
+        .await
+        .is_ok());
+    }
+}
