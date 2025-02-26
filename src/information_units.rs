@@ -23,7 +23,7 @@ impl Username {
     /// Maximal length (in chars) of the username.
     pub const MAX_LEN: usize = 32;
 
-    pub(crate) fn new(username_candidate: &str) -> Result<Username, TextValidityError> {
+    pub fn new(username_candidate: &str) -> Result<Username, TextValidityError> {
         if username_candidate.chars().count() > Username::MAX_LEN {
             return Err(TextValidityError::TooLong {
                 kind_of_entity: "username".to_string(),
